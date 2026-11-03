@@ -1,0 +1,2247 @@
+#!/usr/bin/env bash
+# kemas [brutalist UI] — install prebuilt packages (tar.gz / tar.xz / tar.zst / zip) as desktop apps
+#   tarball -> ~/.local/opt/<name> + symlink ~/.local/bin/<name> + .desktop + icon
+# deps    : gum (install hint selected from /etc/os-release)
+# optional: chafa (terminal icon previews), imagemagick (letter icons), desktop-file-utils, gtk3, unzip
+# usage   : kemas                  -> menu
+#           kemas package.tar.gz   -> install that file directly
+#           kemas <url>            -> download first (direct link or GitHub repo / releases page)
+set -uo pipefail
+
+APP="kemas"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
+CFG="$CFG_DIR/config"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+REG_DIR="$DATA_DIR/$APP/apps"
+CONFIG_REG_DIR="$DATA_DIR/$APP/configs"
+PKG_REG_DIR="$DATA_DIR/$APP/packages"
+OPT_DIR="$HOME/.local/opt"
+BIN_DIR="$HOME/.local/bin"
+APPS_DIR="$DATA_DIR/applications"
+ICON_ROOT="$DATA_DIR/icons/hicolor"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP/downloads"
+
+# ---------- config ----------
+declare -A C=(
+  [SRC_DIR]="$HOME/Downloads"
+  [ICON_FONT]=""
+  [ICON_FONT_NAME]=""
+  [ICON_BG]="#1e1e2e"
+  [ICON_FG]="#cba6f7"
+  [ACCENT]="auto"
+  [UI_STYLE]="clean"
+)
+
+load_cfg() {
+  [[ -f $CFG ]] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    [[ $k =~ ^[A-Z_]+$ ]] && C[$k]=$v
+  done <"$CFG"
+}
+
+save_cfg() {
+  mkdir -p "$CFG_DIR"
+  local k
+  for k in "${!C[@]}"; do printf '%s=%s\n' "$k" "${C[$k]}"; done | sort >"$CFG"
+}
+
+# ---------- look & feel ----------
+# Terminal-native colors: kemas uses the terminal's own ANSI palette (0-15), so it
+# follows whatever your terminal theme is (kitty, foot, alacritty, ...).
+# No dependency on any theme tool. A color is either a bare ANSI/256 number ("5")
+# or a truecolor hex ("#rrggbb"); both work in ui_c and gum.
+ACC=5
+C_DIM=8
+C_TXT=7
+C_OK=2
+C_WARN=3
+C_ERR=1
+C_ON_ACCENT=0
+C_SURFACE=8
+UI_HOST="linux"
+
+# ACCENT setting: auto (ANSI magenta, slot 5) | 0-255 | #rrggbb
+accent() {
+  local a=${C[ACCENT]:-auto}
+  if [[ $a == auto ]]; then a=5
+  elif [[ $a =~ ^[0-9]{1,3}$ ]] && ((a <= 255)); then :
+  elif [[ $a =~ ^#[[:xdigit:]]{6}$ ]]; then :
+  else a=5; fi
+  printf '%s' "$a"
+}
+
+theme() {
+  ACC=$(accent)
+  UI_HOST=$( [[ -r /etc/os-release ]] && . /etc/os-release && printf '%s' "${ID:-linux}" )
+  UI_HOST=${UI_HOST:-linux}
+  export GUM_CHOOSE_CURSOR="  █ " GUM_CHOOSE_CURSOR_FOREGROUND="$ACC" GUM_CHOOSE_SELECTED_FOREGROUND="$ACC"
+  export GUM_CHOOSE_SELECTED_PREFIX="[x] " GUM_CHOOSE_UNSELECTED_PREFIX="[ ] "
+  export GUM_CHOOSE_HEADER_FOREGROUND="$ACC"
+  export GUM_FILTER_PROMPT="  > " GUM_FILTER_PROMPT_FOREGROUND="$ACC"
+  export GUM_FILTER_INDICATOR="  █" GUM_FILTER_INDICATOR_FOREGROUND="$ACC" GUM_FILTER_MATCH_FOREGROUND="$ACC"
+  export GUM_FILTER_HEADER_FOREGROUND="$ACC"
+  export GUM_INPUT_PROMPT_FOREGROUND="$ACC" GUM_INPUT_CURSOR_FOREGROUND="$ACC"
+  export GUM_CONFIRM_PROMPT_FOREGROUND="$C_TXT"
+  export GUM_CONFIRM_SELECTED_BACKGROUND="$ACC" GUM_CONFIRM_SELECTED_FOREGROUND="$C_ON_ACCENT"
+  export GUM_CONFIRM_UNSELECTED_BACKGROUND="$C_SURFACE" GUM_CONFIRM_UNSELECTED_FOREGROUND="$C_TXT"
+}
+
+# ---- ui primitives (no forks except where noted) ----
+# ui_c <color> <text...>: coloured text. color = ANSI number (0-255) or #rrggbb.
+# ANSI numbers follow the terminal palette; hex needs truecolor (else gum fallback).
+ui_c() {
+  local h=${1#\#} r g bl col=$1
+  shift
+  if [[ -n ${NO_COLOR:-} ]]; then printf '%s' "$*"; return; fi
+  if [[ $col =~ ^[0-9]{1,3}$ ]]; then
+    printf '\e[38;5;%dm%s\e[0m' "$col" "$*"
+  elif [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* ]]; then
+    r=$((16#${h:0:2})); g=$((16#${h:2:2})); bl=$((16#${h:4:2}))
+    printf '\e[38;2;%d;%d;%dm%s\e[0m' "$r" "$g" "$bl" "$*"
+  else
+    printf '%s' "$(gum style --foreground "#$h" "$*")"
+  fi
+}
+# ui_esc <fg|bg> <color>: escape for an ANSI number or #rrggbb (hex -> truecolor, else nearest 256-color)
+ui_esc() {
+  local kind=38 col=$2 h r gr b
+  [[ $1 == bg ]] && kind=48
+  if [[ $col =~ ^[0-9]{1,3}$ ]]; then printf '\e[%d;5;%dm' "$kind" "$col"; return; fi
+  h=${col#\#}; r=$((16#${h:0:2})); gr=$((16#${h:2:2})); b=$((16#${h:4:2}))
+  if [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* ]]; then
+    printf '\e[%d;2;%d;%d;%dm' "$kind" "$r" "$gr" "$b"
+  else
+    printf '\e[%d;5;%dm' "$kind" $((16 + 36 * ((r * 5 + 127) / 255) + 6 * ((gr * 5 + 127) / 255) + (b * 5 + 127) / 255))
+  fi
+}
+# ui_inv <bg> <fg> <text...>: inverted bold block
+ui_inv() {
+  local bg=$1 fg=$2
+  shift 2
+  if [[ -n ${NO_COLOR:-} ]]; then printf '%s' "$*"; return; fi
+  printf '%s%s\e[1m%s\e[0m' "$(ui_esc bg "$bg")" "$(ui_esc fg "$fg")" "$*"
+}
+ui_b() { if [[ -n ${NO_COLOR:-} ]]; then printf '%s' "$*"; else printf '\e[1m%s\e[0m' "$*"; fi; }
+
+ui_vlen() { local s; s=$(printf '%s' "$1" | sed -E 's/\x1b\[[0-9;]*m//g'); printf '%d' "${#s}"; }
+ui_rep() { local s; printf -v s '%*s' "$1" ''; printf '%s' "${s// /$2}"; }
+ui_fit() { local max=$1 s=$2; ((${#s} > max)) && s="…${s: -$((max - 1))}"; printf '%s' "$s"; }
+ui_tilde() { local p=$1; [[ $p == "$HOME"* ]] && p="~${p#"$HOME"}"; printf '%s' "$p"; }
+ui_cols() {
+  local w
+  w=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
+  [[ $w =~ ^[0-9]+$ ]] || w=80
+  ((w > 74)) && w=74
+  ((w < 40)) && w=40
+  printf '%d' $((w - 2))
+}
+
+# ui_box <#hex> <width> <line...>
+ui_box() {
+  local col=$1 w=$2 line pad
+  shift 2
+  printf '  %s\n' "$(ui_c "$col" "┏$(ui_rep $((w - 2)) ━)┓")"
+  for line in "$@"; do
+    pad=$((w - 4 - $(ui_vlen "$line"))); ((pad < 0)) && pad=0
+    printf '  %s %s%*s %s\n' "$(ui_c "$col" "┃")" "$line" "$pad" "" "$(ui_c "$col" "┃")"
+  done
+  printf '  %s\n' "$(ui_c "$col" "┗$(ui_rep $((w - 2)) ━)┛")"
+}
+
+# ui_lr <width> <left> <right>: one line, right part flush right
+ui_lr() {
+  local pad
+  pad=$(($1 - 4 - $(ui_vlen "$2") - $(ui_vlen "$3"))); ((pad < 1)) && pad=1
+  printf '%s%*s%s' "$2" "$pad" "" "$3"
+}
+
+# icons: "clean" = plain unicode, "nerd" = Nerd Font glyphs (Settings -> Interface style)
+ui_ico() {
+  if [[ ${C[UI_STYLE]:-clean} == nerd ]]; then
+    case $1 in
+      logo) printf '' ;;      install) printf '' ;;   url) printf '' ;;
+      apps) printf '' ;;      config) printf '' ;;    discover) printf '' ;;
+      leftover) printf '' ;;  settings) printf '' ;;  quit) printf '' ;;
+      back) printf '' ;;      folder) printf '' ;;    path) printf '' ;;
+      font) printf '' ;;      color) printf '' ;;     accent) printf '' ;;
+      style) printf '' ;;     remove) printf '' ;;    edit) printf '' ;;
+      icon) printf '' ;;      check) printf '' ;;     recover) printf '' ;;
+      backup) printf '' ;;    restore) printf '' ;;   keep) printf '' ;;
+      ok) printf '' ;;        warn) printf '' ;;      err) printf '' ;;
+      *) printf '•' ;;
+    esac
+  else
+    case $1 in
+      logo) printf '◆' ;;      install) printf '◆' ;;   url) printf '◇' ;;
+      apps) printf '■' ;;      config) printf '▣' ;;    discover) printf '◎' ;;
+      leftover) printf '◌' ;;  settings) printf '◈' ;;  quit) printf '×' ;;
+      back) printf '←' ;;      folder) printf '▢' ;;    path) printf '▫' ;;
+      font) printf 'A' ;;      color) printf '◐' ;;     accent) printf '◑' ;;
+      style) printf '◒' ;;     remove) printf '✖' ;;    edit) printf '✎' ;;
+      icon) printf '◐' ;;      check) printf '◉' ;;     recover) printf '↺' ;;
+      backup) printf '▪' ;;    restore) printf '↻' ;;   keep) printf '●' ;;
+      ok) printf '[OK]' ;;      warn) printf '[!!]' ;;   err) printf '[XX]' ;;
+      *) printf '•' ;;
+    esac
+  fi
+}
+
+# gum draws headers / confirm prompts at column 0; indent them by 2 so they line up with kemas cards.
+# Installed by main() after the gum check (defining it earlier would hide a missing gum binary).
+ui_gum_wrap() {
+  gum() {
+    local args=() a prev="" i=0
+    for a in "$@"; do
+      i=$((i + 1))
+      [[ $prev == --header ]] && a="  $a"
+      [[ $a == --header=* ]] && a="--header=  ${a#--header=}"
+      if [[ ${1:-} == confirm && $i -gt 1 && $a != -* && $prev != --* ]]; then a="  $a"; fi
+      args+=("$a")
+      prev=$a
+    done
+    command gum "${args[@]}"
+  }
+}
+
+# ui_hero <width>: centered splash box shown above the header on the main menu
+ui_hero() {
+  local w=$1 inner=$(($1 - 4)) line pad lp rp
+  local -a lines=(
+    "$(ui_b "$(ui_c "$ACC" "✦ K E M A S ✦")")"
+    "$(ui_b "$(ui_c "$ACC" "A L L  I N  O N E")")"
+    ""
+    "$(ui_c "$C_DIM" "▸") $(ui_b "$(ui_c "$ACC" "PACKAGE MANAGER")") $(ui_c "$C_DIM" "◂")"
+    ""
+    "$(ui_c "$C_DIM" "TAR · ZIP · DEB · APPIMAGE")"
+    "$(ui_c "$C_DIM" "PACMAN · AUR · APT · DNF · FLATPAK")"
+  )
+  printf '  %s\n' "$(ui_c "$ACC" "╭$(ui_rep $((w - 2)) ─)╮")"
+  for line in "${lines[@]}"; do
+    pad=$((inner - $(ui_vlen "$line"))); ((pad < 0)) && pad=0
+    lp=$((pad / 2)); rp=$((pad - lp))
+    printf '  %s %*s%s%*s %s\n' "$(ui_c "$ACC" "│")" "$lp" "" "$line" "$rp" "" "$(ui_c "$ACC" "│")"
+  done
+  printf '  %s\n' "$(ui_c "$ACC" "╰$(ui_rep $((w - 2)) ─)╯")"
+}
+
+# banner [section [subsection...]]: inverted title bar + stats + breadcrumb
+banner() {
+  local w apps kept left right pad stats crumb s i=0 n=$#
+  w=$(ui_cols)
+  apps=$(find "$REG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
+  apps=$((apps + $(find "$PKG_REG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)))
+  kept=$(kept_apps 2>/dev/null | wc -l)
+  clear
+  printf '\n'
+  if (($# == 0)); then ui_hero "$w"; printf '\n'; fi
+  left=" KEMAS  TARBALL → DESKTOP"
+  right="${UI_HOST^^} "
+  pad=$((w - ${#left} - ${#right})); ((pad < 1)) && pad=1
+  printf '  %s\n' "$(ui_inv "$ACC" "$C_ON_ACCENT" "$left$(printf '%*s' "$pad" '')$right")"
+  stats="$(ui_b "$(ui_c "$ACC" "$apps")") $(ui_c "$C_DIM" APPS) $(ui_c "$C_DIM" ┃) $(ui_b "$(ui_c "$ACC" "$kept")") $(ui_c "$C_DIM" LEFTOVER) $(ui_c "$C_DIM" ┃) $(ui_c "$C_DIM" "SRC $(ui_fit $((w - 30)) "$(ui_tilde "${C[SRC_DIR]}")")")"
+  printf '  %s\n' "$stats"
+  printf '  %s\n' "$(ui_c "$C_DIM" "$(ui_rep "$w" ━)")"
+  if (($#)); then
+    crumb="$(ui_c "$C_DIM" HOME)"
+    for s in "$@"; do
+      i=$((i + 1))
+      if ((i == n)); then crumb+=" $(ui_c "$C_DIM" /) $(ui_b "$(ui_c "$ACC" "${s^^}")")"
+      else crumb+=" $(ui_c "$C_DIM" /) $(ui_c "$C_DIM" "${s^^}")"; fi
+    done
+    printf '  %s\n' "$crumb"
+  fi
+  printf '\n'
+}
+
+# messages (stderr, so they are safe inside $(...))
+info() { printf '  %s %s\n' "$(ui_c "$ACC" ">>")" "$*" >&2; }
+ok() { printf '  %s %s\n' "$(ui_c "$C_OK" "$(ui_ico ok)")" "$*" >&2; }
+warn() { printf '  %s %s\n' "$(ui_c "$C_WARN" "$(ui_ico warn)")" "$*" >&2; }
+err() { printf '  %s %s\n' "$(ui_c "$C_ERR" "$(ui_ico err)")" "$*" >&2; }
+
+# Resolve dependency-install hints from the distro family, then verify the
+# corresponding package manager is actually available on this system.
+package_install_hint() {
+  local pkg=$1 platform manager=""
+  platform=$(detect_platform 2>/dev/null || true)
+
+  case " $platform " in
+    *" arch "*|*" cachyos "*|*" manjaro "*|*" endeavouros "*)
+      command -v pacman >/dev/null 2>&1 && manager=pacman ;;
+    *" debian "*|*" ubuntu "*|*" linuxmint "*|*" pop "*|*" elementary "*)
+      command -v apt-get >/dev/null 2>&1 && manager=apt ;;
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*)
+      command -v dnf >/dev/null 2>&1 && manager=dnf ;;
+    *" opensuse "*|*" suse "*|*" sles "*)
+      command -v zypper >/dev/null 2>&1 && manager=zypper ;;
+    *" alpine "*)
+      command -v apk >/dev/null 2>&1 && manager=apk ;;
+  esac
+
+  # Fallback for derivatives or unusual os-release metadata.
+  if [[ -z $manager ]]; then
+    if command -v pacman >/dev/null 2>&1; then manager=pacman
+    elif command -v apt-get >/dev/null 2>&1; then manager=apt
+    elif command -v dnf >/dev/null 2>&1; then manager=dnf
+    elif command -v zypper >/dev/null 2>&1; then manager=zypper
+    elif command -v apk >/dev/null 2>&1; then manager=apk
+    fi
+  fi
+
+  case $manager in
+    pacman) printf 'sudo pacman -S %s' "$pkg" ;;
+    apt)    printf 'sudo apt install %s' "$pkg" ;;
+    dnf)    printf 'sudo dnf install %s' "$pkg" ;;
+    zypper) printf 'sudo zypper install %s' "$pkg" ;;
+    apk)    printf 'sudo apk add %s' "$pkg" ;;
+    *)      printf 'install %s using your distribution package manager' "$pkg" ;;
+  esac
+}
+
+needs_tool() {
+  local tool=$1 hint
+  hint=$(package_install_hint "$tool")
+  warn "needs $tool: $hint"
+  return 1
+}
+
+ask() {
+  local v
+  printf '  %s\n' "$(ui_c "$ACC" "? $1")" >&2
+  v=$(gum input --prompt "  > " --value "${2:-}" --placeholder "${3:-}" --width "$(ui_cols)") || { printf '\e[1A\e[2K' >&2; return 1; }
+  printf '\e[1A\e[2K\r  %s %s\n' "$(ui_c "$C_DIM" "? $1")" "$(ui_c "$ACC" "${v:-—}")" >&2
+  printf '%s' "$v"
+}
+
+ui_pause() {
+  printf '\n  %s%s%s\n' "$(ui_c "$C_DIM" "[")" "$(ui_c "$ACC" "ENTER")" "$(ui_c "$C_DIM" "] CONTINUE")" >&2
+  IFS= read -r _ </dev/tty 2>/dev/null || true
+}
+
+# section heading / hints / result card (stdout, like the old gum style calls)
+ui_h() {
+  local t="${*^^}" n
+  n=$(($(ui_cols) - ${#t} - 5)); ((n < 3)) && n=3
+  printf '\n  %s %s\n' "$(ui_b "$(ui_c "$ACC" "■ $t")")" "$(ui_c "$C_DIM" "$(ui_rep "$n" ━)")"
+}
+ui_next() { printf '  %s %s  %s\n' "$(ui_c "$C_DIM" '$')" "$(ui_c "$ACC" "$1")" "$(ui_c "$C_DIM" "// $2")"; }
+ui_result() {   # ui_result <title> <key|value>...
+  local w title=$1 kv k v lines=()
+  shift
+  w=$(ui_cols)
+  lines+=("$(ui_b "$(ui_c "$C_OK" "$(ui_ico ok) ${title^^}")")" "")
+  for kv in "$@"; do
+    k=${kv%%|*}; v=${kv#*|}
+    lines+=("$(ui_c "$C_DIM" "$(printf '%-8s' "${k^^}")") $(ui_fit $((w - 15)) "$(ui_tilde "$v")")")
+  done
+  ui_box "$C_OK" "$w" "${lines[@]}"
+}
+
+# menu_pick <header> <"icon-key|Label">... -> prints the chosen Label (icons are display-only)
+menu_pick() {
+  local header=$1 item lab out i disp=() labels=()
+  shift
+  for item in "$@"; do
+    lab=${item#*|}
+    labels+=("$lab")
+    if [[ $lab == "← "* ]]; then disp+=("   $lab"); else disp+=("$(ui_ico "${item%%|*}")  $lab"); fi
+  done
+  out=$(gum choose --header "■ $header" "${disp[@]}") || return 1
+  for i in "${!disp[@]}"; do
+    if [[ ${disp[i]} == "$out" ]]; then printf '%s' "${labels[i]}"; return 0; fi
+  done
+  return 1
+}
+
+# app_card <name>: details of one installed app
+app_card() {
+  local w
+  w=$(ui_cols)
+  (
+    reg_load "$1" || exit 1
+    size=$(du -sh -- "$DIR" 2>/dev/null | cut -f1)
+    if [[ -x $LINK && -d $DIR ]]; then state="$(ui_c "$C_OK" "● ready")"; else state="$(ui_c "$C_ERR" "✖ broken: launcher or folder missing")"; fi
+    ui_box "$ACC" "$w" "$(ui_b "${DISP:-$NAME}")" "" \
+      "$(ui_c "$C_DIM" "COMMAND ") $NAME" \
+      "$(ui_c "$C_DIM" "FOLDER  ") $(ui_fit $((w - 15)) "$(ui_tilde "$DIR")")" \
+      "$(ui_c "$C_DIM" "SIZE    ") ${size:-?}   $(ui_c "$C_DIM" "ICON") ${ICON:-?}" \
+      "$(ui_c "$C_DIM" "STATUS  ") $state"
+  )
+}
+
+# ---------- utils ----------
+slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'; }
+titlecase() { printf '%s' "$1" | sed -E 's/[-_]+/ /g; s/\b(.)/\u\1/g'; }
+
+guess_name() {
+  basename "$1" | sed -E '
+    s/\.(tar\.(gz|xz|zst|bz2)|tgz|txz|zip)$//I
+    s/[-_.](linux|x86[_-]?64|amd64|x64|musl|gnu|static|unknown|appimage)([-_.].*)?$//I
+    s/[-_.]v?[0-9]+(\.[0-9]+)+.*$//
+    s/([A-Za-z]{3,})[0-9]{3,}$/\1/'
+}
+
+refresh_dbs() {
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS_DIR" 2>/dev/null
+  command -v gtk-update-icon-cache >/dev/null && [[ -d $ICON_ROOT ]] \
+    && gtk-update-icon-cache -q -f -t "$ICON_ROOT" 2>/dev/null
+  return 0
+}
+
+STAGE=""
+ROOT=""
+ARCHIVE=""
+KIND=""
+CANDS=""
+INSTALL_ARGS=""
+DOWNLOADED=""
+ICON_NAME=""
+ICON_FILES=()
+NAME="" DISP="" DIR="" LINK="" DESKTOP="" PACKAGE=""
+ICONFILES=()
+
+cleanup() { [[ -n $STAGE && -d $STAGE ]] && rm -rf "$STAGE"; STAGE=""; }
+trap cleanup EXIT
+
+# ---------- pick & read archive ----------
+find_archives() {
+  find "$1" -maxdepth 1 -type f \( -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.tar.xz' \
+    -o -iname '*.txz' -o -iname '*.tar.zst' -o -iname '*.tar.bz2' -o -iname '*.zip' -o -iname '*.deb' -o -iname '*.appimage' \) \
+    -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+}
+
+pick_archive() {
+  local dir=${C[SRC_DIR]} mode list sel p
+  while :; do
+    mode=$(menu_pick "Package source" "folder|Browse $dir" "path|Type a file / folder path" "back|Cancel") || return 1
+    case $mode in
+      Cancel) return 1 ;;
+      Type*)
+        p=$(ask "path:" "" "~/Downloads or ~/Downloads/app.tar.gz") || return 1
+        p=${p/#\~/$HOME}
+        if [[ -f $p ]]; then ARCHIVE=$p; return 0
+        elif [[ -d $p ]]; then dir=$p
+        else warn "not found: $p"; continue; fi
+        ;;
+    esac
+    list=$(find_archives "$dir")
+    if [[ -z $list ]]; then warn "no tarball/zip in $dir"; continue; fi
+    sel=$(printf '%s\n' "$list" | sed 's|.*/||' | gum filter --placeholder "search packages...") || continue
+    ARCHIVE="$dir/$sel"
+    return 0
+  done
+}
+
+stage_extract() {
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/kemas.XXXXXX") || return 1
+  case ${1,,} in
+    *.zip)
+      command -v unzip >/dev/null || { needs_tool unzip; return 1; }
+      unzip -q "$1" -d "$STAGE" ;;
+    *) tar xf "$1" -C "$STAGE" --no-same-owner ;;
+  esac || { warn "failed to extract $1"; return 1; }
+  ROOT=$STAGE
+  local n only
+  n=$(find "$STAGE" -mindepth 1 -maxdepth 1 | wc -l)
+  if [[ $n -eq 1 ]]; then
+    only=$(find "$STAGE" -mindepth 1 -maxdepth 1)
+    [[ -d $only ]] && ROOT=$only
+  fi
+  return 0
+}
+
+find_execs() {
+  (cd "$ROOT" && find . -type f -perm -u+x ! -name '*.so' ! -name '*.so.*' ! -name '*.dll' \
+    -printf '%d %P\n' | sort -n | head -40 | cut -d' ' -f2-)
+}
+
+find_elfs() {
+  (cd "$ROOT" && find . -maxdepth 3 -type f ! -name '*.so' ! -name '*.so.*' -printf '%P\n' |
+    while IFS= read -r f; do
+      [[ $(head -c4 "$f" 2>/dev/null) == $'\x7fELF' ]] && printf '%s\n' "$f"
+    done)
+}
+
+detect_kind() {
+  CANDS=$(find_execs)
+  [[ -z $CANDS ]] && CANDS=$(find_elfs)
+  if [[ -n $(find "$ROOT" -maxdepth 2 -name PKGBUILD -print -quit) ]]; then
+    KIND=pkgbuild
+  elif [[ -z $CANDS && -n $(find "$ROOT" -maxdepth 2 \( -name configure -o -name Makefile \
+    -o -name CMakeLists.txt -o -name Cargo.toml -o -name meson.build -o -name setup.py \) -print -quit) ]]; then
+    KIND=source
+  elif [[ -z $CANDS ]]; then
+    KIND=empty
+  else
+    KIND=prebuilt
+  fi
+}
+
+# ---------- icons ----------
+icon_from_file() {
+  local src=$1 name=$2 ext sz dst tmp rc
+  ext=${src##*.}; ext=${ext,,}
+  case $ext in
+    svg) dst="$ICON_ROOT/scalable/apps/$name.svg" ;;
+    png)
+      sz=$(file -b "$src" | sed -nE 's/.*, ([0-9]+) ?x ?[0-9]+.*/\1/p')
+      sz=${sz:-256}
+      dst="$ICON_ROOT/${sz}x${sz}/apps/$name.png" ;;
+    *)
+      command -v magick >/dev/null || { warn "format .$ext needs imagemagick"; return 1; }
+      tmp=$(mktemp --suffix=.png)
+      magick "${src}[0]" -resize 256x256 "$tmp" || { rm -f "$tmp"; return 1; }
+      icon_from_file "$tmp" "$name"; rc=$?; rm -f "$tmp"; return $rc ;;
+  esac
+  mkdir -p "$(dirname "$dst")" && cp -f "$src" "$dst" || return 1
+  ICON_FILES+=("$dst")
+  ICON_NAME=$name
+}
+
+icon_from_tree() {
+  local tree=$1 first f
+  first=$(find "$tree" -path '*/apps/*' \( -name '*.png' -o -name '*.svg' \) -print -quit)
+  [[ -n $first ]] || { warn "hicolor tree is empty"; return 1; }
+  first=${first##*/}
+  mkdir -p "$ICON_ROOT" && cp -r "$tree"/. "$ICON_ROOT"/ || return 1
+  while IFS= read -r f; do ICON_FILES+=("$ICON_ROOT/$f"); done < <(cd "$tree" && find . -type f -printf '%P\n')
+  ICON_NAME=${first%.*}
+}
+
+icon_from_url() {
+  local name=$1 url ext tmp rc
+  url=$(ask "Icon URL (png/svg):" "" "https://raw.githubusercontent.com/...") || return 1
+  [[ -n $url ]] || return 1
+  if [[ $url == https://github.com/*/blob/* ]]; then
+    url=${url/https:\/\/github.com/https:\/\/raw.githubusercontent.com}
+    url=${url/\/blob\//\/}
+  fi
+  ext=${url%%\?*}; ext=${ext##*.}
+  tmp=$(mktemp --suffix=".$ext")
+  curl -fsSL "$url" -o "$tmp" || { warn "download failed"; rm -f "$tmp"; return 1; }
+  icon_from_file "$tmp" "$name"; rc=$?; rm -f "$tmp"; return $rc
+}
+
+icon_from_github() {
+  local name=$1 url repo branch path tmp dir tree best rc=1
+  command -v git >/dev/null || { needs_tool git; return 1; }
+  url=$(ask "GitHub folder URL:" "" "https://github.com/user/repo/tree/main/path/to/icons") || return 1
+  url=${url%/}
+  if [[ $url =~ ^https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+)$ ]]; then
+    repo="https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}.git"
+    branch=${BASH_REMATCH[3]}
+    path=${BASH_REMATCH[4]}
+  else
+    warn "expected https://github.com/<user>/<repo>/tree/<branch>/<path>"
+    return 1
+  fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/kemas-icons.XXXXXX")
+  info "fetching $path from ${repo##*/} ($branch)"
+  if git clone -q --depth 1 --filter=blob:none --sparse --branch "$branch" "$repo" "$tmp/r" 2>/dev/null \
+    && git -C "$tmp/r" sparse-checkout set "$path" 2>/dev/null && [[ -d $tmp/r/$path ]]; then
+    dir="$tmp/r/$path"
+    tree=$(find "$dir" -type d -name hicolor -print -quit)
+    if [[ -n $tree ]] && icon_from_tree "$tree"; then
+      rc=0
+    else
+      best=$(find "$dir" -type f \( -iname '*.svg' -o -iname '*.png' \) -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+      if [[ -n $best ]]; then
+        icon_from_file "$best" "$name" && rc=0
+      else
+        warn "no png/svg found in that folder"
+      fi
+    fi
+  else
+    warn "fetch failed (check the URL / branch / path)"
+  fi
+  rm -rf "$tmp"
+  return $rc
+}
+
+icon_letter() {
+  local name=$1 disp=$2 L tmp rc font=()
+  command -v magick >/dev/null || { needs_tool imagemagick; return 1; }
+  L=$(printf '%s' "$disp" | cut -c1 | tr '[:lower:]' '[:upper:]')
+  [[ -n ${C[ICON_FONT]} ]] && font=(-font "${C[ICON_FONT]}")
+  tmp=$(mktemp --suffix=.png)
+  magick -size 256x256 xc:none -fill "${C[ICON_BG]}" -draw "roundrectangle 0,0 255,255 56,56" \
+    "${font[@]}" -fill "${C[ICON_FG]}" -gravity center -pointsize 160 -annotate +0+0 "$L" "$tmp" \
+    || { warn "failed to generate icon"; rm -f "$tmp"; return 1; }
+  icon_from_file "$tmp" "$name"; rc=$?; rm -f "$tmp"; return $rc
+}
+
+# Return image metadata used by the icon candidate scorer.
+# Output: "width height"; unknown dimensions are reported as "0 0".
+icon_image_dimensions() {
+  local src=$1 desc w=0 h=0
+  desc=$(file -b -- "$src" 2>/dev/null || true)
+  if [[ $desc =~ ([0-9]+)[[:space:]]*x[[:space:]]*([0-9]+) ]]; then
+    w=${BASH_REMATCH[1]}; h=${BASH_REMATCH[2]}
+  elif [[ ${src,,} == *.svg ]]; then
+    # Read only the SVG header; width/height may be absent when viewBox is used.
+    desc=$(head -c 8192 -- "$src" 2>/dev/null || true)
+    if [[ $desc =~ viewBox=[\"\'][^\"\']*[[:space:]]([0-9.]+)[[:space:]]+([0-9.]+)[\"\'] ]]; then
+      w=${BASH_REMATCH[1]%.*}; h=${BASH_REMATCH[2]%.*}
+    elif [[ $desc =~ width=[\"\']([0-9.]+) ]]; then
+      w=${BASH_REMATCH[1]%.*}
+      [[ $desc =~ height=[\"\']([0-9.]+) ]] && h=${BASH_REMATCH[1]%.*}
+    fi
+  fi
+  printf '%s %s' "${w:-0}" "${h:-0}"
+}
+
+# Score candidate images from an extracted package.
+# Output: one tab-separated "score<TAB>relative-path<TAB>width<TAB>height" per candidate.
+icon_candidates() {
+  local root=$1 app_name=$2 desktop_icon=${3:-} rel base lower stem dims w h score ratio
+  local -a files=()
+  while IFS= read -r -d '' rel; do files+=("$rel"); done < <(
+    cd "$root" && find . -type f \( -iname '*.png' -o -iname '*.svg' \) -printf '%P\0' 2>/dev/null
+  )
+
+  for rel in "${files[@]}"; do
+    base=${rel##*/}; lower=${rel,,}; stem=${base%.*}; score=0
+
+    # Hard exclusions: these are almost never application launcher icons.
+    [[ $lower =~ (toolbar|splash|theme_adjuster|about-font|document|template|backup|thumbnail|preview|peak|cursor|\.desktop\.png) ]] && continue
+
+    dims=$(icon_image_dimensions "$root/$rel")
+    read -r w h <<<"$dims"
+    [[ $w =~ ^[0-9]+$ ]] || w=0
+    [[ $h =~ ^[0-9]+$ ]] || h=0
+
+    # Semantic hints.
+    [[ -n $desktop_icon && ${base%.*} == "$desktop_icon" ]] && ((score+=110))
+    [[ $lower =~ (^|/)(hicolor|icons?)(/|$) ]] && ((score+=25))
+    [[ $lower =~ (^|/)(apps|applications)(/|$) ]] && ((score+=25))
+    [[ $lower =~ (^|/)(resources|assets|images?)(/|$) ]] && ((score+=10))
+    [[ ${base,,} =~ ^(icon|logo|app|application)([-_.].*)?\.(png|svg)$ ]] && ((score+=55))
+    [[ ${stem,,} == "$app_name" ]] && ((score+=65))
+    [[ ${base,,} =~ ^main\.(png|svg)$ && $lower =~ /resources/ ]] && ((score+=60))
+
+    # Image geometry. Avoid treating dimensions as proof on their own.
+    if ((w > 0 && h > 0)); then
+      ratio=$((w * 100 / h))
+      (( ratio >= 80 && ratio <= 125 )) && ((score+=20))
+      (( w >= 128 && h >= 128 )) && ((score+=15))
+      (( w < 64 || h < 64 )) && ((score-=35))
+      (( w > 2048 || h > 2048 )) && ((score-=10))
+    fi
+    [[ ${rel,,} == *.svg ]] && ((score+=10))
+
+    (( score >= 35 )) && printf '%s\t%s\t%s\t%s\n' "$score" "$rel" "$w" "$h"
+  done | sort -t $'\t' -k1,1nr -k2,2
+}
+
+# Render one candidate in the terminal when chafa is available.
+icon_preview_candidate() {
+  local src=$1 rel=$2 score=$3 w=$4 h=$5
+  clear
+  ui_box "$ACC" "$(ui_cols)" "$(ui_b "Icon candidate preview")"
+  printf '\n  %s\n  %sx%s · score %s\n\n' "$rel" "$w" "$h" "$score"
+  if command -v chafa >/dev/null; then
+    chafa --size 36x18 --colors full --symbols block --animate off "$src" 2>/dev/null || true
+  else
+    warn "chafa is not installed; showing metadata-only preview"
+    printf '  %s\n' "$src"
+  fi
+  printf '\n'
+}
+
+# pick_icon <name> <display> <root-to-scan> -> sets ICON_NAME, fills ICON_FILES
+pick_icon() {
+  local name=$1 disp=$2 root=$3 choice tree f p hint desktop_icon="" ranked="" top_line="" top_score=0 top_path="" second_score=0
+  local score w h accepted
+  local -a opts=() rows=() cands=() choices=()
+  tree=$(find "$root" -type d -name hicolor -print -quit 2>/dev/null)
+
+  # Use a packaged desktop entry as a strong hint, but never trust its Icon= blindly.
+  hint=$(find "$root" -path '*/applications/*.desktop' -print -quit 2>/dev/null)
+  if [[ -n $hint ]]; then
+    desktop_icon=$(sed -n 's/^Icon=//p' "$hint" | head -1)
+    desktop_icon=${desktop_icon##*/}; desktop_icon=${desktop_icon%.*}
+  fi
+
+  ranked=$(icon_candidates "$root" "${name,,}" "$desktop_icon")
+  [[ -n $ranked ]] && mapfile -t rows <<<"$ranked"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r score f w h <<<"$row"
+    cands+=("$f")
+  done
+
+  if ((${#rows[@]})); then
+    IFS=$'\t' read -r top_score top_path _ _ <<<"${rows[0]}"
+    ((${#rows[@]} > 1)) && { IFS=$'\t' read -r second_score _ _ _ <<<"${rows[1]}"; }
+  fi
+
+  # Confident result: strong semantic match and a clear lead over the next candidate.
+  if [[ ${KEMAS_ICON_FORCE_PREVIEW:-0} != 1 ]] && (( top_score >= 95 && top_score - second_score >= 20 )); then
+    info "auto-selected icon: $top_path (score $top_score)"
+  elif [[ ${KEMAS_ICON_FORCE_PREVIEW:-0} == 1 ]] && ((${#rows[@]})); then
+    info "forced icon preview enabled (KEMAS_ICON_FORCE_PREVIEW=1)"
+  fi
+
+  # No suitable package icon: generate a monogram automatically.
+  if ((${#rows[@]} == 0)); then
+    info "no suitable package icon found; generating fallback"
+    icon_letter "$name" "$disp" && return 0
+    ICON_NAME="application-x-executable"
+    warn "could not generate fallback; using generic theme icon"
+    return 0
+  fi
+
+  # Ambiguous candidates: let the user inspect up to five ranked options.
+  if ((${#rows[@]})); then
+    for row in "${rows[@]:0:5}"; do
+      IFS=$'\t' read -r score f w h <<<"$row"
+      choices+=("$f  ·  ${w}x${h}  ·  score ${score}")
+    done
+
+    while :; do
+      choice=$(gum choose --header "Icon candidates for $disp (ranked; select to preview)" \
+        "${choices[@]}" "Generate fallback icon" "More icon options...") || break
+      case $choice in
+        "Generate fallback icon") icon_letter "$name" "$disp" && return 0 ;;
+        "More icon options...") break ;;
+        *)
+          f=${choice%%  ·  *}
+          for row in "${rows[@]:0:5}"; do
+            IFS=$'\t' read -r score p w h <<<"$row"
+            [[ $p == "$f" ]] && break
+          done
+          icon_preview_candidate "$root/$f" "$f" "$score" "$w" "$h"
+          if gum confirm "Use this icon?"; then
+            icon_from_file "$root/$f" "$name" && return 0
+          fi
+          ;;
+      esac
+    done
+  fi
+
+  opts=()
+  [[ -n $tree ]] && opts+=("Use hicolor tree from the package")
+  opts+=("Icon file from path (png/svg/ico)" "Download from URL" "Fetch icon folder from GitHub"
+    "Auto letter (font: ${C[ICON_FONT_NAME]:-default})" "Icon theme name" "Skip (generic icon / gear)")
+  while :; do
+    choice=$(gum choose --header "Icon for $disp" "${opts[@]}") || return 1
+    case $choice in
+      "Use hicolor"*) icon_from_tree "$tree" && return 0 ;;
+      "Icon file"*)
+        p=$(ask "icon path:" "" "~/Downloads/icon.png") || continue
+        p=${p/#\~/$HOME}
+        [[ -f $p ]] || { warn "not found: $p"; continue; }
+        icon_from_file "$p" "$name" && return 0 ;;
+      "Download"*) icon_from_url "$name" && return 0 ;;
+      "Fetch icon"*) icon_from_github "$name" && return 0 ;;
+      "Auto letter"*) icon_letter "$name" "$disp" && return 0 ;;
+      "Icon theme"*)
+        p=$(ask "icon theme name:" "" "utilities-terminal") || continue
+        [[ -n $p ]] || continue
+        ICON_NAME=$p; return 0 ;;
+      Skip*)
+        # No icon should ever block installation. Prefer a generated monogram.
+        icon_letter "$name" "$disp" && return 0
+        ICON_NAME="application-x-executable"; warn "could not generate fallback; using generic theme icon"; return 0 ;;
+    esac
+  done
+}
+
+# ---------- registry ----------
+reg_save() {
+  mkdir -p "$REG_DIR"
+  {
+    printf 'NAME=%q\nDISP=%q\nDIR=%q\nLINK=%q\nDESKTOP=%q\nICON=%q\nPACKAGE=%q\n' \
+      "$NAME" "$DISP" "$DIR" "$LINK" "$DESKTOP" "$ICON_NAME" "$PACKAGE"
+    printf 'ICONFILES=('
+    if ((${#ICON_FILES[@]})); then printf ' %q' "${ICON_FILES[@]}"; fi
+    printf ' )\n'
+  } >"$REG_DIR/$NAME.conf"
+}
+
+reg_load() {
+  [[ -f $REG_DIR/$1.conf ]] || return 1
+  NAME="" DISP="" DIR="" LINK="" DESKTOP="" ICON="" PACKAGE=""
+  ICONFILES=()
+  # shellcheck disable=SC1090
+  source "$REG_DIR/$1.conf"
+  ICON_NAME=$ICON
+}
+
+# ---------- persistent config registry ----------
+# Config records survive app uninstall; paths are revalidated before use.
+config_reg_save() {
+  local name=$1 disp=$2 p
+  shift 2
+  mkdir -p "$CONFIG_REG_DIR"
+  {
+    printf 'NAME=%q\nDISP=%q\n' "$name" "$disp"
+    printf 'PATHS=('
+    for p in "$@"; do printf ' %q' "$p"; done
+    printf ' )\n'
+  } >"$CONFIG_REG_DIR/$name.conf"
+}
+
+config_reg_load() {
+  [[ -f $CONFIG_REG_DIR/$1.conf ]] || return 1
+  NAME="" DISP="" PATHS=()
+  # shellcheck disable=SC1090
+  source "$CONFIG_REG_DIR/$1.conf"
+}
+
+config_reg_sync() {
+  local name=$1 disp=$2 old=() found=() p
+  if config_reg_load "$name"; then old=("${PATHS[@]}"); fi
+  mapfile -t found < <(leftover_find "$name" "$disp")
+  for p in "${old[@]}"; do
+    [[ -d $p ]] && [[ ! " ${found[*]} " == *" $p "* ]] && found+=("$p")
+  done
+  config_reg_save "$name" "$disp" "${found[@]}"
+}
+
+# ---------- install core ----------
+# install_core <name> <disp> <comment> <terminal:true|false> <categories> <relative-exe>
+install_core() {
+  local name=$1 disp=$2 comment=$3 term=$4 cats=$5 exe=$6
+  local dest="$OPT_DIR/$name" link="$BIN_DIR/$name" desk="$APPS_DIR/$name.desktop"
+  mkdir -p "$OPT_DIR" "$BIN_DIR" "$APPS_DIR"
+  rm -rf -- "$dest"
+  cp -a "$ROOT" "$dest" || { warn "failed to copy to $dest"; return 1; }
+  chmod +x "$dest/$exe"
+  ln -sfn "$dest/$exe" "$link"
+  ICON_FILES=()
+  ICON_NAME=""
+  NAME=$name DISP=$disp DIR=$dest LINK=$link DESKTOP=$desk PACKAGE=""
+  INSTALL_COMMENT=$comment INSTALL_TERM=$term INSTALL_CATS=$cats
+  return 0
+}
+
+write_desktop() {
+  mkdir -p "$APPS_DIR"
+  {
+    printf '[Desktop Entry]\nType=Application\n'
+    printf 'Name=%s\nComment=%s\n' "$DISP" "$INSTALL_COMMENT"
+    printf 'Exec="%s"%s\n' "$LINK" "${INSTALL_ARGS:+ $INSTALL_ARGS}"
+    printf 'Icon=%s\nTerminal=%s\nCategories=%s\nStartupNotify=true\n' \
+      "$ICON_NAME" "$INSTALL_TERM" "$INSTALL_CATS"
+  } >"$DESKTOP"
+  chmod +x "$DESKTOP"
+  if command -v desktop-file-validate >/dev/null; then
+    desktop-file-validate "$DESKTOP" && ok ".desktop is valid" || warn "desktop-file-validate reported warnings"
+  fi
+}
+
+norm() { printf '%s' "${1,,}" | tr -cd 'a-z0-9'; }
+
+# real program? ELF binary or shebang script (skips +x data files like .html/.txt)
+is_bin() {
+  local h
+  h=$(head -c4 -- "$ROOT/$1" 2>/dev/null)
+  [[ $h == $'\x7fELF' || ${h:0:2} == '#!' ]]
+}
+
+# order candidate executables: exact name match first, helper-ish binaries last
+rank_execs() {
+  local want f b m=() o=() n=()
+  want=$(norm "$1")
+  while IFS= read -r f; do
+    [[ -n $f ]] || continue
+    is_bin "$f" || continue
+    b=${f##*/}
+    if [[ -n $want && $(norm "$b") == "$want" ]]; then m+=("$f")
+    elif [[ $f =~ crashpad|sandbox|helper|updater|uninstall|\.sh$|/vendor/|/scripts/ ]]; then n+=("$f")
+    else o+=("$f"); fi
+  done <<<"$CANDS"
+  if ((${#m[@]} + ${#o[@]} + ${#n[@]} == 0)); then printf '%s\n' "$CANDS"; return 0; fi
+  printf '%s\n' "${m[@]}" "${o[@]}" "${n[@]}"
+}
+
+# print the one non-helper binary that sits closest to the root (nothing if tied)
+pick_shallowest() {
+  local f d min=999 cnt=0 best=""
+  for f in "$@"; do
+    [[ $f =~ crashpad|sandbox|helper|updater|uninstall|\.sh$|/vendor/|/scripts/ ]] && continue
+    d=${f//[^\/]/}; d=${#d}
+    if ((d < min)); then min=$d; cnt=1; best=$f
+    elif ((d == min)); then cnt=$((cnt + 1)); fi
+  done
+  if ((cnt == 1)); then printf '%s' "$best"; fi
+  return 0
+}
+
+# packaged .desktop (deb-style layouts ship one under usr/share/applications)
+find_hint() { find "$ROOT" -path '*/applications/*.desktop' -print -quit 2>/dev/null; }
+hint_get() { sed -n "s/^$2=//p" "$1" | head -1; }
+
+# exe declared by the packaged .desktop Exec= line, relative to ROOT (empty if not resolvable)
+hint_exe() {
+  local hint=$1 tok rel b
+  tok=$(hint_get "$hint" Exec | awk '{print $1}' | tr -d '"')
+  [[ -n $tok ]] || return 0
+  rel=${tok#/}
+  if [[ -f $ROOT/$rel ]]; then printf '%s' "$rel"; return 0; fi
+  b=${tok##*/}
+  while IFS= read -r f; do
+    [[ -n $f && ${f##*/} == "$b" ]] && { printf '%s' "$f"; return 0; }
+  done <<<"$CANDS"
+  return 0
+}
+
+# --- .deb / AppImage support (kemas-deb-appimage-patch) ---
+CONV_DIR=""
+CONV_TAR=""
+
+conv_cleanup() {
+  [[ -n $CONV_DIR && -d $CONV_DIR ]] && rm -rf -- "$CONV_DIR"
+  CONV_DIR=""; CONV_TAR=""
+  return 0
+}
+
+# Inspect a .deb before deciding whether it can be handled portably.
+deb_preflight() {
+  local deb=$1 platform control payload bad="" scripts="" link target resolved f base pkg
+  platform=$(detect_platform)
+  CONV_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kemas-deb.XXXXXX") || return 1
+  mkdir -p "$CONV_DIR/ar" "$CONV_DIR/tree" "$CONV_DIR/control"
+
+  if command -v ar >/dev/null 2>&1; then
+    (cd "$CONV_DIR/ar" && ar x "$deb") || { warn "could not read Debian archive"; return 1; }
+  elif command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xf "$deb" -C "$CONV_DIR/ar" || { warn "could not read Debian archive"; return 1; }
+  else
+    warn "reading .deb requires ar (binutils) or bsdtar"; return 1
+  fi
+
+  payload=$(find "$CONV_DIR/ar" -maxdepth 1 -type f -name 'data.tar*' -print -quit)
+  control=$(find "$CONV_DIR/ar" -maxdepth 1 -type f -name 'control.tar*' -print -quit)
+  [[ -n $payload ]] || { warn "not a valid .deb: data archive missing"; return 1; }
+  if [[ -n $control ]]; then
+    tar xf "$control" -C "$CONV_DIR/control" --no-same-owner 2>/dev/null || true
+  fi
+
+  for f in preinst postinst prerm postrm; do
+    [[ -f $CONV_DIR/control/$f ]] && scripts+="$f "
+  done
+
+  tar tf "$payload" > "$CONV_DIR/paths.txt" || { warn "could not inspect package payload"; return 1; }
+  # Portable extraction must not recreate Debian's system layout on another distro.
+  if grep -Eq '^(\./)?(etc|lib|sbin|usr/bin|usr/sbin|usr/lib/systemd|lib/systemd|var)/' "$CONV_DIR/paths.txt"; then
+    bad+="system-level paths ";
+  fi
+  if [[ -n $scripts ]]; then bad+="maintainer scripts ($scripts) "; fi
+  if grep -Eq '(^|/)(systemd|.*\.service|.*\.socket|.*\.timer)(/|$)' "$CONV_DIR/paths.txt"; then
+    bad+="systemd integration ";
+  fi
+
+  if [[ $platform == *arch* || $platform == *cachyos* || $platform == *manjaro* || $platform == *endeavouros* ]]; then
+    printf '\n'
+    printf '  %s\n' "$(ui_b "$(ui_c "$C_WARN" "⚠ HOLD UP, BRO.")")"
+    printf '  %s\n' "$(ui_b "You're on Arch. Why are you trying to install a Debian package?!")"
+    warn "Kemas will not install Debian system files, maintainer scripts, or services on Arch."
+    info "Use an Arch repository package, AUR package, or Flatpak when available."
+    if [[ -n $bad ]]; then
+      warn "portable .deb inspection flagged: $bad"
+      warn "Installation refused. No files were installed."
+      return 1
+    fi
+    if ! gum confirm "This .deb appears portable. Continue with isolated extraction?"; then
+      info "installation cancelled"; return 1
+    fi
+  elif [[ $platform == *debian* || $platform == *ubuntu* || $platform == *linuxmint* || $platform == *pop* ]]; then
+    info "Debian-based distro detected. Prefer native APT installation."
+    if command -v apt-get >/dev/null 2>&1 && gum confirm "Install this .deb through APT (native package integration)?"; then
+      sudo apt-get install "$(realpath -- "$deb")"
+      return $?
+    fi
+    warn "native APT installation was not selected; portable extraction will be considered"
+    [[ -z $bad ]] || { warn "portable installation refused: $bad"; return 1; }
+  else
+    warn "non-Debian distro detected; portable .deb install is experimental"
+    [[ -z $bad ]] || { warn "portable installation refused: $bad"; return 1; }
+    gum confirm "Continue with isolated extraction of this apparently portable .deb?" || return 1
+  fi
+
+  tar xf "$payload" -C "$CONV_DIR/tree" --no-same-owner --no-same-permissions \
+    || { warn "failed to extract Debian payload"; return 1; }
+
+  # Reject absolute symlinks and links that escape the extracted app tree.
+  while IFS= read -r -d '' link; do
+    target=$(readlink -- "$link")
+    [[ $target == /* ]] && { warn "absolute symlink is not portable: ${link#"$CONV_DIR/tree/"} -> $target"; return 1; }
+    resolved=$(realpath -m -- "$(dirname "$link")/$target")
+    [[ $resolved == "$CONV_DIR/tree"/* || $resolved == "$CONV_DIR/tree" ]] || {
+      warn "symlink escapes package tree: ${link#"$CONV_DIR/tree/"}"; return 1;
+    }
+  done < <(find "$CONV_DIR/tree" -type l -print0)
+
+  base=$(basename -- "$deb"); base=${base%.[dD][eE][bB]}; pkg=${base%%_*}
+  tar -C "$CONV_DIR/tree" -cf - . | gzip -1 > "$CONV_DIR/$pkg.tar.gz" || return 1
+  CONV_TAR="$CONV_DIR/$pkg.tar.gz"
+}
+
+# .AppImage -> temporary tar.gz with the extracted tree (AppRun = launcher)
+appimage_to_tar() {
+  local img base run root d
+  img=$(realpath -- "$1") || return 1
+  base=$(basename -- "$img"); base=${base%.[aA]pp[iI]mage}
+  CONV_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kemas-conv.XXXXXX") || return 1
+  run=$img
+  if [[ ! -x $img ]]; then
+    cp -- "$img" "$CONV_DIR/app.AppImage" && chmod +x "$CONV_DIR/app.AppImage" \
+      || { warn "cannot copy $(basename -- "$img")"; return 1; }
+    run=$CONV_DIR/app.AppImage
+  fi
+  info "unpacking AppImage (runs its own --appimage-extract, no FUSE needed)"
+  (cd "$CONV_DIR" && "$run" --appimage-extract >/dev/null 2>&1)
+  root=$CONV_DIR/squashfs-root
+  [[ -d $root ]] || { warn "could not unpack this AppImage (--appimage-extract failed)"; return 1; }
+  # expose the root .desktop where the normal flow looks for packaged ones
+  d=$(find "$root" -maxdepth 1 -name '*.desktop' -print -quit)
+  if [[ -n $d ]]; then
+    mkdir -p "$root/usr/share/applications"
+    sed -E 's|^Exec=[^ ]+|Exec=AppRun|' "$d" > "$root/usr/share/applications/${d##*/}"
+  fi
+  # kemas: AppRun wrapper (kemas-apprun-fix)
+  # scripts using dirname "$0" break when launched through the ~/.local/bin symlink,
+  # so AppRun becomes a tiny wrapper that resolves its own real location first
+  if [[ -e $root/AppRun || -L $root/AppRun ]]; then
+    mv -- "$root/AppRun" "$root/AppRun.orig"
+    cat > "$root/AppRun" <<'WRAP'
+#!/bin/sh
+self=$(readlink -f "$0")
+APPDIR=$(dirname "$self")
+export APPDIR
+exec "$APPDIR/AppRun.orig" "$@"
+WRAP
+    chmod +x "$root/AppRun"
+  else
+    warn "no AppRun inside; you may have to pick the executable by hand"
+  fi
+  tar -C "$CONV_DIR" -cf - squashfs-root | gzip -1 > "$CONV_DIR/$base.tar.gz" || return 1
+  CONV_TAR="$CONV_DIR/$base.tar.gz"
+}
+
+# front door: convert .deb / .AppImage, then hand over to the original code
+do_install() {
+  local src=${1:-} rc deb
+  if [[ -z $src ]]; then pick_archive || return 0; src=$ARCHIVE; fi
+  [[ -f $src ]] || { warn "not a file: $src"; return 0; }
+  conv_cleanup
+  case ${src,,} in
+    *.deb)
+      deb=$(realpath -- "$src") || { conv_cleanup; return 0; }
+      if ! deb_preflight "$deb"; then conv_cleanup; return 0; fi
+      # A native APT install completes here; no portable tar is produced.
+      if [[ -z $CONV_TAR ]]; then conv_cleanup; return 0; fi
+      src=$CONV_TAR ;;
+    *.appimage) appimage_to_tar "$src" || { conv_cleanup; return 0; }; src=$CONV_TAR ;;
+  esac
+  do_install_archive "$src"; rc=$?
+  conv_cleanup
+  return $rc
+}
+
+do_install_archive() {
+  if [[ -n ${1:-} ]]; then ARCHIVE=$1; else pick_archive || return 0; fi
+  [[ -f $ARCHIVE ]] || { warn "not a file: $ARCHIVE"; return 0; }
+  case ${ARCHIVE,,} in
+    *.pkg.tar.*)
+      warn "this is already a pacman package, installing it with kemas would bypass pacman."
+      if gum confirm "Install with sudo pacman -U instead?"; then sudo pacman -U -- "$ARCHIVE"; fi
+      return 0 ;;
+  esac
+  info "reading $(basename "$ARCHIVE")"
+  stage_extract "$ARCHIVE" || { cleanup; return 0; }
+  detect_kind
+
+  case $KIND in
+    pkgbuild)
+      warn "contains a PKGBUILD (AUR snapshot), use makepkg instead."
+      if gum confirm "Run makepkg -si now?"; then
+        local pd; pd=$(dirname "$(find "$ROOT" -maxdepth 2 -name PKGBUILD -print -quit)")
+        (cd "$pd" && makepkg -si)
+      fi
+      cleanup; return 0 ;;
+    source)
+      warn "this is source code (configure/Makefile/CMake/Cargo), not a prebuilt binary."
+      info "cleaner to write a PKGBUILD so pacman tracks it. This script only handles prebuilt binaries."
+      cleanup; return 0 ;;
+    empty)
+      warn "no executable found inside the archive."
+      cleanup; return 0 ;;
+  esac
+
+  local arr=() exe name disp comment term cats guess hint="" h_name="" h_comment="" h_cats="" h_exe nm
+  guess=$(slugify "$(guess_name "$ARCHIVE")")
+  hint=$(find_hint)
+  if [[ -n $hint ]]; then
+    h_name=$(hint_get "$hint" Name); h_comment=$(hint_get "$hint" Comment); h_cats=$(hint_get "$hint" Categories)
+    h_exe=$(hint_exe "$hint")
+  fi
+  mapfile -t arr < <(rank_execs "$guess")
+  nm=$(norm "$guess")
+  if [[ -n ${h_exe:-} ]]; then
+    exe=$h_exe; info "found packaged .desktop, using its Exec"
+  elif ((${#arr[@]} == 1)); then
+    exe=${arr[0]}
+  elif [[ -n $nm && $(norm "${arr[0]##*/}") == "$nm" && $(norm "${arr[1]##*/}") != "$nm" ]]; then
+    exe=${arr[0]}; info "auto-selected by name match"
+  elif exe=$(pick_shallowest "${arr[@]}"); [[ -n $exe ]]; then
+    info "auto-selected: only top-level binary"
+  else
+    exe=$(printf '%s\n' "${arr[@]}" | gum filter --header "Pick the main executable" --placeholder "search...") \
+      || { cleanup; return 0; }
+  fi
+  info "executable: $exe"
+
+  name=$(ask "Command name:" "$(slugify "$(guess_name "$ARCHIVE")")") || { cleanup; return 0; }
+  name=$(slugify "$name")
+  [[ -n $name ]] || { cleanup; return 0; }
+  if [[ -f $REG_DIR/$name.conf || -e $OPT_DIR/$name ]]; then
+    gum confirm "$name already exists, overwrite?" || { cleanup; return 0; }
+  fi
+  if [[ -e $BIN_DIR/$name && ! -L $BIN_DIR/$name ]]; then
+    gum confirm "$BIN_DIR/$name is not a symlink (regular file), overwrite?" || { cleanup; return 0; }
+    rm -f -- "$BIN_DIR/$name"
+  fi
+  disp=$(ask "Launcher name:" "${h_name:-$(titlecase "$name")}") || { cleanup; return 0; }
+  comment=$(ask "Description:" "${h_comment:-$disp}") || { cleanup; return 0; }
+  INSTALL_ARGS=$(ask "Extra launch args (optional):" "" "e.g. --no-sandbox") || { cleanup; return 0; }
+  if gum confirm --default=false "Terminal app (CLI/TUI)? Choose No for GUI"; then term=true; else term=false; fi
+  cats=$(gum choose --no-limit --selected Utility --header "Categories" \
+    Utility Development Game Network AudioVideo Graphics Office System | tr '\n' ';')
+  [[ -n $cats ]] || cats=${h_cats:-Utility;}
+
+  install_core "$name" "$disp" "$comment" "$term" "$cats" "$exe" || { cleanup; return 0; }
+  pick_icon "$name" "$disp" "$DIR" || {
+    ICON_FILES=()
+    if ! icon_letter "$name" "$disp"; then
+      ICON_NAME="application-x-executable"
+      warn "could not generate fallback; using generic theme icon"
+    fi
+  }
+  write_desktop
+  reg_save
+  config_reg_sync "$NAME" "$DISP"
+  refresh_dbs
+  cleanup
+
+  printf '\n'
+  ui_result "$DISP installed" "command|$name" "folder|$DIR" "desktop|$DESKTOP" "icon|$ICON_NAME"
+  printf '\n'
+  info "if it doesn't show up in the launcher: restart it or relogin (cache)."
+  ui_next "kemas diagnose $name" "if the app does not open or misbehaves"
+  ui_next "kemas recover $name" "find package alternatives"
+  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not in PATH -> fish_add_path ~/.local/bin" ;; esac
+}
+
+# ---------- fetch from URL ----------
+is_url() { [[ $1 =~ ^https?:// ]]; }
+
+GH_RE='^https://github\.com/([^/]+)/([^/#?]+)(/releases(/tag/([^/#?]+)|/latest)?)?/?$'
+
+# GitHub repo / releases page -> let the user pick an asset, prints its download URL
+github_pick_asset() {
+  local owner repo tag api json assets names name
+  [[ $1 =~ $GH_RE ]] || return 1
+  owner=${BASH_REMATCH[1]}; repo=${BASH_REMATCH[2]%.git}; tag=${BASH_REMATCH[5]:-}
+  if [[ -n $tag ]]; then api="https://api.github.com/repos/$owner/$repo/releases/tags/$tag"
+  else api="https://api.github.com/repos/$owner/$repo/releases/latest"; fi
+  info "reading release info for $owner/$repo${tag:+ ($tag)}"
+  json=$(curl -fsSL "$api") || { warn "could not read releases (no release, or GitHub rate limit)"; return 1; }
+  assets=$(grep -oE '"browser_download_url": *"[^"]+"' <<<"$json" | sed -E 's/.*"(https?[^"]+)"$/\1/')
+  [[ -n $assets ]] || { warn "this release has no downloadable assets"; return 1; }
+  names=$(sed 's|.*/||' <<<"$assets")
+  names=$({ grep -iE 'linux|x86_64|amd64|\.deb$|\.rpm$|pkg\.tar|appimage' <<<"$names"; \
+    grep -ivE 'linux|x86_64|amd64|\.deb$|\.rpm$|pkg\.tar|appimage' <<<"$names"; } | awk 'NF && !s[$0]++')
+  name=$(gum filter --header "Pick an asset" --placeholder "search..." <<<"$names") || return 1
+  grep -F "/$name" <<<"$assets" | head -1
+}
+
+# fetch_url <url> -> sets ARCHIVE and DOWNLOADED
+fetch_url() {
+  local url=$1 name dest
+  command -v curl >/dev/null || { needs_tool curl; return 1; }
+  if [[ $url =~ $GH_RE ]]; then url=$(github_pick_asset "$url") || return 1; fi
+  name=${url%%\?*}; name=${name##*/}
+  [[ -n $name ]] || name="download.bin"
+  mkdir -p "$CACHE_DIR"
+  dest="$CACHE_DIR/$name"
+  [[ $url == http://* ]] && warn "plain http: the download is not protected"
+  info "downloading $name"
+  curl -fL --progress-bar -o "$dest" "$url" || { warn "download failed"; rm -f "$dest"; return 1; }
+  if file -b "$dest" | grep -qi '^HTML'; then
+    warn "got a web page, not a package (wrong link?)"; rm -f "$dest"; return 1
+  fi
+  info "sha256: $(sha256sum "$dest" | cut -d' ' -f1)"
+  ARCHIVE=$dest
+  DOWNLOADED=$dest
+}
+
+install_from_url() {
+  DOWNLOADED=""
+  fetch_url "$1" || return 0
+  do_install "$ARCHIVE"
+  if [[ -n $DOWNLOADED && -f $DOWNLOADED ]] && gum confirm "Delete the downloaded file?"; then
+    rm -f -- "$DOWNLOADED"
+  fi
+}
+
+# ---------- manage installed apps ----------
+# --- smart uninstall cleanup (kemas-cleanup-patch) ---
+LEFT_DIR="$DATA_DIR/$APP/leftovers"
+BACKUP_DIR="$DATA_DIR/$APP/backups"
+
+# only direct children of these folders are ever considered
+leftover_roots() { printf '%s\n' "$HOME/.config" "$HOME/.local/share" "$HOME/.cache" "$HOME/.local/state"; }
+
+# real (non-symlink) direct child of a leftover root, and not kemas' own data
+leftover_safe() {
+  local p=$1 rp parent root rr
+  [[ -e $p && ! -L $p ]] || return 1
+  rp=$(realpath -e -- "$p" 2>/dev/null) || return 1
+  [[ $rp == "$CFG_DIR" || $rp == "$DATA_DIR/$APP" ]] && return 1
+  parent=$(dirname -- "$rp")
+  while IFS= read -r root; do
+    rr=$(realpath -e -- "$root" 2>/dev/null) || continue
+    [[ $parent == "$rr" ]] && return 0
+  done < <(leftover_roots)
+  return 1
+}
+
+# leftover_find <name> <display> -> paths whose name matches the app
+leftover_find() {
+  local name=${1,,} disp=${2,,} root p b
+  [[ -n $name ]] || return 0
+  while IFS= read -r root; do
+    [[ -d $root ]] || continue
+    while IFS= read -r -d '' p; do
+      b=${p##*/}; b=${b,,}
+      case $b in
+        "$name" | "$disp" | "$name"-* | "$name"_* | "$name".*)
+          leftover_safe "$p" && printf '%s\n' "$p" ;;
+      esac
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+  done < <(leftover_roots)
+}
+
+leftover_describe() {
+  local p=$1 n=1 s
+  [[ -d $p ]] && n=$(find "$p" -type f 2>/dev/null | wc -l)
+  s=$(du -sh -- "$p" 2>/dev/null | cut -f1)
+  printf '  %s %s  %s\n' "$(ui_c "$ACC" "$(ui_ico leftover)")" "~${p#"$HOME"}" "$(ui_c "$C_DIM" "($n files, $s)")"
+}
+
+# remembered ("kept") leftovers per app
+kept_save() {
+  local name=$1
+  shift
+  mkdir -p "$LEFT_DIR"
+  if (($#)); then printf '%s\n' "$@" >"$LEFT_DIR/$name.list"; else rm -f -- "$LEFT_DIR/$name.list"; fi
+}
+kept_load() {
+  local f="$LEFT_DIR/$1.list" p
+  [[ -f $f ]] || return 0
+  while IFS= read -r p; do
+    [[ -n $p ]] && leftover_safe "$p" && printf '%s\n' "$p"
+  done <"$f"
+  return 0
+}
+kept_apps() { find "$LEFT_DIR" -maxdepth 1 -name '*.list' -printf '%f\n' 2>/dev/null | sed 's/\.list$//' | sort; }
+
+# leftover_backup <name> <paths...> -> prints the archive path, verified readable
+leftover_backup() {
+  local name=$1 out p rel=()
+  shift
+  mkdir -p "$BACKUP_DIR" || return 1
+  out="$BACKUP_DIR/$name-$(date +%Y%m%d-%H%M%S).tar.gz"
+  for p in "$@"; do rel+=("${p#"$HOME"/}"); done
+  if tar -czf "$out" -C "$HOME" -- "${rel[@]}" 2>/dev/null && tar -tzf "$out" >/dev/null 2>&1 && [[ -s $out ]]; then
+    printf '%s' "$out"
+  else
+    rm -f -- "$out"
+    return 1
+  fi
+}
+
+leftover_remove() {
+  local p
+  for p in "$@"; do leftover_safe "$p" && rm -rf -- "$p"; done
+  return 0
+}
+
+# leftover_action <name> <paths...>: Keep / Backup then remove / Remove permanently
+leftover_action() {
+  local name=$1 choice typed archive
+  shift
+  choice=$(gum choose --header "What should happen to this data?" \
+    "Keep data" "Backup, then remove" "Remove permanently") || choice="Keep data"
+  case $choice in
+    Backup*)
+      if archive=$(leftover_backup "$name" "$@"); then
+        ok "backup saved: $archive"
+        leftover_remove "$@"
+        kept_save "$name"
+        ok "data removed"
+      else
+        warn "backup failed, nothing was removed"
+        kept_save "$name" "$@"
+      fi ;;
+    Remove*)
+      typed=$(ask "Type \"$name\" to permanently remove it:" "") || typed=""
+      if [[ $typed == "$name" ]]; then
+        leftover_remove "$@"
+        kept_save "$name"
+        ok "data removed"
+      else
+        warn "not confirmed, data kept"
+        kept_save "$name" "$@"
+      fi ;;
+    *)
+      kept_save "$name" "$@"
+      info "data kept. Manage it later with: kemas cleanup" ;;
+  esac
+}
+
+# leftover_handle <name> <display>: called right after an app is removed
+leftover_handle() {
+  local name=$1 paths=() p
+  mapfile -t paths < <(leftover_find "$1" "$2")
+  if ((${#paths[@]} == 0)); then kept_save "$name"; return 0; fi
+  warn "this app left data behind (never deleted without your say-so):"
+  for p in "${paths[@]}"; do leftover_describe "$p" >&2; done
+  leftover_action "$name" "${paths[@]}"
+}
+
+backup_restore() {
+  local f=$1
+  if tar -tzf "$f" 2>/dev/null | grep -qE '(^/|(^|/)\.\.(/|$))'; then
+    warn "unsafe paths inside the archive, refusing"
+    return 1
+  fi
+  tar -tzf "$f" 2>/dev/null | head -12 | sed 's|^|  ~/|' >&2
+  gum confirm "Restore into $HOME? Files with the same path are overwritten." || return 0
+  tar -xzf "$f" -C "$HOME" && ok "restored"
+}
+
+backups_menu() {
+  local list=() sel act f
+  while :; do
+    banner "Leftover data" "Backups"
+    mapfile -t list < <(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' -printf '%T@ %f\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    if ((${#list[@]} == 0)); then warn "no backups yet."; sleep 1.5; return; fi
+    sel=$(printf '%s\n' "${list[@]}" "← back" | gum choose --header "Backups ($BACKUP_DIR)") || return
+    [[ $sel == "← back" ]] && return
+    f="$BACKUP_DIR/$sel"
+    act=$(gum choose --header "$sel" "Restore to home folder" "Delete this backup" "← back") || continue
+    case $act in
+      Restore*) backup_restore "$f"; ui_pause ;;
+      Delete*) gum confirm "Delete $sel permanently?" && rm -f -- "$f" && ok "backup deleted" ;;
+    esac
+  done
+}
+
+cleanup_menu() {
+  local apps=() ents=() n paths=() p
+  while :; do
+    banner "Leftover data"
+    ents=()
+    mapfile -t apps < <(kept_apps)
+    for n in "${apps[@]}"; do
+      [[ -n $n ]] || continue
+      if [[ -n $(kept_load "$n") ]]; then ents+=("$n"); else rm -f -- "$LEFT_DIR/$n.list"; fi
+    done
+    n=$(printf '%s\n' "${ents[@]}" "Backups" "← back" | gum choose --header "Data left behind by removed apps") || return
+    case $n in
+      "← back") return ;;
+      Backups) backups_menu ;;
+      *)
+        mapfile -t paths < <(kept_load "$n")
+        info "$n"
+        for p in "${paths[@]}"; do leftover_describe "$p" >&2; done
+        leftover_action "$n" "${paths[@]}"
+        sleep 1 ;;
+    esac
+  done
+}
+
+uninstall_app() {
+  reg_load "$1" || return 0
+  gum confirm "Remove $DISP along with its icon & launcher entry?" || return 0
+  # Capture config paths before removing the app registry entry.
+  config_reg_sync "$NAME" "$DISP"
+  [[ -n $DIR && $DIR == "$OPT_DIR"/* ]] && rm -rf -- "$DIR"
+  [[ -L $LINK ]] && rm -f -- "$LINK"
+  rm -f -- "$DESKTOP" "$REG_DIR/$1.conf"
+  if ((${#ICONFILES[@]})); then rm -f -- "${ICONFILES[@]}"; fi
+  refresh_dbs
+  ok "$DISP removed"
+  leftover_handle "$1" "$DISP"
+}
+
+change_icon() {
+  reg_load "$1" || return 0
+  local old=("${ICONFILES[@]}") f
+  ICON_FILES=()
+  if pick_icon "$NAME" "$DISP" "$DIR"; then
+    for f in "${old[@]}"; do
+      [[ " ${ICON_FILES[*]} " == *" $f "* ]] || rm -f -- "$f"
+    done
+    sed -i "s|^Icon=.*|Icon=$ICON_NAME|" "$DESKTOP"
+    reg_save
+    refresh_dbs
+    ok "icon for $DISP -> $ICON_NAME"
+  else
+    warn "cancelled, keeping the old icon"
+  fi
+}
+
+# --- app data management ---
+# appdata_manage <name> <display> [paths...]
+appdata_manage() {
+  local name=$1 disp=$2 paths=() p choice typed archive
+  shift 2
+  if (($#)); then
+    paths=("$@")
+  else
+    config_reg_sync "$name" "$disp"
+    config_reg_load "$name" && paths=("${PATHS[@]}")
+  fi
+  # Drop stale or unsafe paths before presenting destructive actions.
+  local valid=()
+  for p in "${paths[@]}"; do leftover_safe "$p" && valid+=("$p"); done
+  paths=("${valid[@]}")
+  config_reg_save "$name" "$disp" "${paths[@]}"
+  if ((${#paths[@]} == 0)); then
+    warn "no config/data folders found for $disp"
+    return 0
+  fi
+  info "config & data for $disp:"
+  for p in "${paths[@]}"; do leftover_describe "$p" >&2; done
+  if pgrep -x "$name" >/dev/null 2>&1; then
+    warn "$name seems to be running; it may recreate files when it exits"
+    gum confirm "Continue anyway?" || return 0
+  fi
+  choice=$(gum choose --header "What should happen to this data?" \
+    "Keep data" "Backup, then reset" "Delete permanently") || return 0
+  case $choice in
+    Backup*)
+      if archive=$(leftover_backup "$name" "${paths[@]}"); then
+        ok "backup saved: $archive"
+        leftover_remove "${paths[@]}"
+        config_reg_save "$name" "$disp"
+        ok "config reset (most apps recreate defaults on next launch)"
+      else
+        warn "backup failed, nothing was removed"
+      fi ;;
+    Delete*)
+      typed=$(ask "Type \"$name\" to permanently delete it:" "") || typed=""
+      if [[ $typed == "$name" ]]; then
+        leftover_remove "${paths[@]}"
+        config_reg_save "$name" "$disp"
+        ok "config deleted"
+      else
+        warn "not confirmed, nothing deleted"
+      fi ;;
+    *) info "nothing changed" ;;
+  esac
+}
+
+# Filesystem discovery is deliberately separate from the persistent registry.
+# It exposes direct-child config/data folders not yet associated with a Kemas app.
+config_discover_menu() {
+  local candidates=() root p label selected name
+  while IFS= read -r root; do
+    [[ -d $root ]] || continue
+    while IFS= read -r -d '' p; do
+      leftover_safe "$p" || continue
+      candidates+=("$p")
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  done < <(leftover_roots)
+  if ((${#candidates[@]} == 0)); then warn "no discoverable config/data directories found"; return 0; fi
+  selected=$(printf '%s\n' "${candidates[@]}" | gum filter --header "Untracked config/data folders (filesystem discovery)" --placeholder "search path...") || return 0
+  [[ -n $selected ]] || return 0
+  name=$(basename -- "$selected")
+  label=$(titlecase "$name")
+  appdata_manage "$name" "$label" "$selected"
+}
+
+config_menu() {
+  local entries=() files=() f n disp selected
+  while :; do
+    banner "Config & data"
+    entries=()
+    mkdir -p "$CONFIG_REG_DIR"
+    mapfile -t files < <(find "$CONFIG_REG_DIR" -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null | sort)
+    for f in "${files[@]}"; do
+      n=${f%.conf}
+      if config_reg_load "$n"; then
+        disp=${DISP:-$n}
+        config_reg_sync "$n" "$disp"
+        config_reg_load "$n"
+        if ((${#PATHS[@]})); then
+          entries+=("$n — $disp")
+        else
+          entries+=("$n — $disp [no paths currently found]")
+        fi
+      fi
+    done
+    selected=$(printf '%s\n' "${entries[@]}" "Discover untracked folders" "← back" | gum choose --header "Config & data (independent of installed apps)") || return
+    case $selected in
+      "← back") return ;;
+      "Discover untracked folders") config_discover_menu ;;
+      *)
+        n=${selected%% — *}
+        if config_reg_load "$n"; then
+          appdata_manage "$NAME" "$DISP" "${PATHS[@]}"
+          ui_pause
+        fi ;;
+    esac
+  done
+}
+
+# ---------- packages installed through "Package discovery" ----------
+# kemas records every package it installs from a package manager (pacman, paru, apt,
+# dnf, zypper, flatpak) so it can list and remove them later, next to tarball apps.
+pkg_reg_file() { printf '%s/%s__%s.conf' "$PKG_REG_DIR" "$1" "${2//\//_}"; }
+pkg_reg_save() {   # <source> <package>
+  mkdir -p "$PKG_REG_DIR"
+  printf 'P_SRC=%q\nP_NAME=%q\nP_WHEN=%q\n' "$1" "$2" "$(date +%F)" >"$(pkg_reg_file "$1" "$2")"
+}
+pkg_reg_load() {   # <registry file>
+  P_SRC="" P_NAME="" P_WHEN=""
+  [[ -f $1 ]] || return 1
+  # shellcheck disable=SC1090
+  source "$1"
+  [[ -n $P_SRC && -n $P_NAME ]]
+}
+pkg_installed() {  # <source> <package>
+  case $1 in
+    pacman|paru) pacman -Qq -- "$2" >/dev/null 2>&1 ;;
+    apt) dpkg-query -W -f='${Status}' "$2" 2>/dev/null | grep -q 'ok installed' ;;
+    dnf|zypper) rpm -q -- "$2" >/dev/null 2>&1 ;;
+    flatpak) flatpak info "$2" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+# sets PKG_CMD to the removal command for <source> <package>
+pkg_remove_cmd() {
+  case $1 in
+    pacman|paru) PKG_CMD=(sudo pacman -Rns -- "$2") ;;
+    apt) PKG_CMD=(sudo apt remove "$2") ;;
+    dnf) PKG_CMD=(sudo dnf remove "$2") ;;
+    zypper) PKG_CMD=(sudo zypper remove "$2") ;;
+    flatpak) PKG_CMD=(flatpak uninstall "$2") ;;
+    *) return 1 ;;
+  esac
+}
+pkg_protected() {  # core system packages that kemas refuses to remove
+  [[ $2 == gum ]] && return 0
+  case $1 in pacman|paru) ;; *) return 1 ;; esac
+  [[ $2 =~ ^(base|linux|linux-.+|linux-firmware.*|systemd.*|glibc|pacman.*|bash|sudo|filesystem|grub)$ ]]
+}
+
+# pkg_remove_flow <source> <package> <label>: returns 0 when the package is gone
+pkg_remove_flow() {
+  local src=$1 pkg=$2 label=$3 PKG_CMD=()
+  if pkg_protected "$src" "$pkg"; then err "$pkg is a core system package; kemas will not remove it"; return 1; fi
+  pkg_remove_cmd "$src" "$pkg" || { err "unknown package source: $src"; return 1; }
+  info "Remove command: ${PKG_CMD[*]}"
+  gum confirm "Run this removal command now?" || { info "removal cancelled"; return 1; }
+  "${PKG_CMD[@]}"
+  if pkg_installed "$src" "$pkg"; then warn "$pkg is still installed"; return 1; fi
+  rm -f -- "$(pkg_reg_file "$src" "$pkg")"
+  ok "$label removed"
+  return 0
+}
+
+# pkg_actions <source> <package> <label> <tracked 0|1> [since]
+pkg_actions() {
+  local src=$1 pkg=$2 label=$3 tracked=${4:-0} when=${5:-} act state w lines
+  local -a items=("remove|Remove")
+  ((tracked)) && items+=("keep|Stop tracking")
+  items+=("back|← back")
+  while :; do
+    banner "Installed apps" "$pkg"
+    w=$(ui_cols)
+    if pkg_installed "$src" "$pkg"; then state="$(ui_c "$C_OK" "● installed")"; else state="$(ui_c "$C_ERR" "✖ not installed")"; fi
+    lines=("$(ui_b "$(ui_fit $((w - 6)) "$label")")" ""
+      "$(ui_c "$C_DIM" "PACKAGE ") $(ui_fit $((w - 15)) "$pkg")"
+      "$(ui_c "$C_DIM" "SOURCE  ") $src")
+    [[ -n $when ]] && lines+=("$(ui_c "$C_DIM" "SINCE   ") $when")
+    lines+=("$(ui_c "$C_DIM" "STATUS  ") $state")
+    ui_box "$ACC" "$w" "${lines[@]}"
+    printf '\n'
+    act=$(menu_pick "Actions" "${items[@]}") || break
+    case $act in
+      Remove) if pkg_remove_flow "$src" "$pkg" "$label"; then ui_pause; break; fi; ui_pause ;;
+      "Stop tracking") rm -f -- "$(pkg_reg_file "$src" "$pkg")"; ok "kemas no longer tracks $pkg (it stays installed)"; ui_pause; break ;;
+      *) break ;;
+    esac
+  done
+}
+
+# outside_scan <apps|all>: prints "source<TAB>package<TAB>label" for packages that are
+# explicitly installed (not dependencies). "apps" keeps only packages that ship a launcher.
+outside_scan() {
+  local mode=${1:-apps} platform
+  platform=$(detect_platform)
+  case " $platform " in
+    *" arch "*|*" cachyos "*|*" manjaro "*|*" endeavouros "*)
+      if command -v pacman >/dev/null; then
+        if [[ $mode == apps ]]; then
+          comm -12 <(pacman -Qeq 2>/dev/null | sort -u) <(pacman -Qoq /usr/share/applications/*.desktop 2>/dev/null | sort -u)
+        else
+          pacman -Qeq 2>/dev/null | sort -u
+        fi | awk '{ printf "pacman\t%s\t%s\n", $1, $1 }'
+      fi ;;
+    *" debian "*|*" ubuntu "*|*" linuxmint "*|*" pop "*|*" elementary "*)
+      if command -v apt-mark >/dev/null; then
+        if [[ $mode == apps ]]; then
+          comm -12 <(apt-mark showmanual 2>/dev/null | sort -u) <(dpkg -S /usr/share/applications/*.desktop 2>/dev/null | cut -d: -f1 | sort -u)
+        else
+          apt-mark showmanual 2>/dev/null | sort -u
+        fi | awk '{ printf "apt\t%s\t%s\n", $1, $1 }'
+      fi ;;
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*)
+      command -v rpm >/dev/null && rpm -qf --qf '%{NAME}\n' /usr/share/applications/*.desktop 2>/dev/null \
+        | sort -u | awk '{ printf "dnf\t%s\t%s\n", $1, $1 }' ;;
+    *" opensuse "*|*" suse "*|*" sles "*)
+      command -v rpm >/dev/null && rpm -qf --qf '%{NAME}\n' /usr/share/applications/*.desktop 2>/dev/null \
+        | sort -u | awk '{ printf "zypper\t%s\t%s\n", $1, $1 }' ;;
+  esac
+  if command -v flatpak >/dev/null; then
+    flatpak list --app --columns=application,name 2>/dev/null \
+      | awk -F'\t' '$1 != "" { printf "flatpak\t%s\t%s (%s)\n", $1, $2, $1 }'
+  fi
+  return 0
+}
+
+manage_outside_apps() {
+  local mode act line src pkg label sel i total
+  local -a lines=() rows=() srcs=() pkgs=() labels=()
+  while :; do
+    banner "Installed apps" "Outside kemas"
+    act=$(menu_pick "Which packages?" "apps|Apps with a launcher" "discover|All explicitly installed" "back|← back") || return 0
+    case $act in
+      "Apps with a launcher") mode=apps ;;
+      "All explicitly installed") mode=all ;;
+      *) return 0 ;;
+    esac
+    while :; do
+      banner "Installed apps" "Outside kemas"
+      info "scanning installed packages..."
+      mapfile -t lines < <(outside_scan "$mode")
+      rows=(); srcs=(); pkgs=(); labels=()
+      for line in "${lines[@]}"; do
+        IFS=$'\t' read -r src pkg label <<<"$line"
+        [[ -n $src && -n $pkg ]] || continue
+        [[ -f $(pkg_reg_file "$src" "$pkg") ]] && continue   # already tracked under "Installed with kemas"
+        rows+=("$label  [$src]"); srcs+=("$src"); pkgs+=("$pkg"); labels+=("$label")
+      done
+      total=${#rows[@]}
+      if ((total == 0)); then warn "no packages found"; sleep 1.5; break; fi
+      sel=$(printf '%s\n' "${rows[@]}" | gum filter --header "Installed outside kemas · $total packages · esc = back" --placeholder "search...") || break
+      for i in "${!rows[@]}"; do
+        if [[ ${rows[i]} == "$sel" ]]; then pkg_actions "${srcs[i]}" "${pkgs[i]}" "${labels[i]}" 0; break; fi
+      done
+    done
+  done
+}
+
+app_actions() {   # actions for one tarball app registered by kemas
+  local n=$1 act
+  while :; do
+    banner "Installed apps" "$n"
+    app_card "$n"
+    printf '\n'
+    act=$(menu_pick "Actions" "check|Check runtime compatibility" "recover|Find alternative packages" "icon|Change icon" "edit|Edit .desktop (VS Code)" "config|Config & data" "remove|Remove" "back|← back") || break
+    case $act in
+      "Check runtime compatibility") runtime_check_app "$n"; ui_pause ;;
+      "Find alternative packages") smart_recovery_app "$n"; ui_pause ;;
+      "Change icon") change_icon "$n"; sleep 1 ;;
+      Edit*) reg_load "$n" && code "$DESKTOP" ;;
+      "Config & data") reg_load "$n" && appdata_manage "$NAME" "$DISP"; ui_pause ;;
+      Remove) uninstall_app "$n"; ui_pause; break ;;
+      *) break ;;
+    esac
+  done
+}
+
+manage_kemas_apps() {   # tarball apps + packages installed through Package discovery
+  local apps=() pfiles=() rows=() keys=() n f i sel key row
+  while :; do
+    banner "Installed apps" "With kemas"
+    mapfile -t apps < <(find "$REG_DIR" -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null | sed 's/\.conf$//' | sort)
+    mapfile -t pfiles < <(find "$PKG_REG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | sort)
+    if ((${#apps[@]} + ${#pfiles[@]} == 0)); then warn "nothing installed through kemas yet."; sleep 1.5; return; fi
+    rows=(); keys=()
+    for n in "${apps[@]}"; do
+      row=$(reg_load "$n" && { if [[ -x $LINK && -d $DIR ]]; then printf '●'; else printf '✖'; fi; printf '  %-18s %s' "$n" "${DISP:-$n}"; })
+      rows+=("${row:-●  $n}"); keys+=("app:$n")
+    done
+    for f in "${pfiles[@]}"; do
+      row=$(pkg_reg_load "$f" && { if pkg_installed "$P_SRC" "$P_NAME"; then printf '●'; else printf '✖'; fi; printf '  %-18s [%s]' "$P_NAME" "$P_SRC"; })
+      [[ -n $row ]] || continue
+      rows+=("$row"); keys+=("pkg:$f")
+    done
+    sel=$(printf '%s\n' "${rows[@]}" "← back" | gum choose --header "Installed with kemas   ● ready   ✖ broken") || return
+    [[ $sel == "← back" ]] && return
+    key=""
+    for i in "${!rows[@]}"; do
+      if [[ ${rows[i]} == "$sel" ]]; then key=${keys[i]}; break; fi
+    done
+    case $key in
+      app:*) app_actions "${key#app:}" ;;
+      pkg:*) pkg_reg_load "${key#pkg:}" && pkg_actions "$P_SRC" "$P_NAME" "$P_NAME" 1 "$P_WHEN" ;;
+    esac
+  done
+}
+
+manage_apps() {
+  local act
+  while :; do
+    banner "Installed apps"
+    act=$(menu_pick "Where was it installed from?" "apps|Installed with kemas" "discover|Installed outside kemas" "back|← back") || return 0
+    case $act in
+      "Installed with kemas") manage_kemas_apps ;;
+      "Installed outside kemas") manage_outside_apps ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+# ---------- runtime compatibility ----------
+# Static-ish runtime check for an installed app. Uses ldd on executable ELF files;
+# only run this on apps the user chose to install (ldd is not a safe parser for hostile binaries).
+is_elf_path() {
+  [[ -f $1 ]] && [[ $(head -c4 -- "$1" 2>/dev/null) == $'\x7fELF' ]]
+}
+
+runtime_check_app() {
+  local app_name=${1:-} dir main f out rc=0 scanned=0
+  local arch host_arch cache path module
+  local -a bins=() issues=() notes=()
+  [[ -n $app_name ]] || { warn "usage: kemas diagnose <app-command>"; return 2; }
+  reg_load "$app_name" || { warn "no Kemas registry entry for: $app_name"; return 1; }
+  dir=$DIR
+  main=$(readlink -f -- "$LINK" 2>/dev/null || true)
+
+  # Collect likely ELF entry points without assuming every app uses usr/bin.
+  [[ -n $main ]] && is_elf_path "$main" && bins+=("$main")
+  if [[ -d $dir/usr/bin ]]; then
+    while IFS= read -r -d '' f; do
+      is_elf_path "$f" && bins+=("$f")
+    done < <(find "$dir/usr/bin" -maxdepth 1 -type f -perm /111 -print0 2>/dev/null | sort -z)
+  fi
+  if ((${#bins[@]} == 0)); then
+    while IFS= read -r -d '' f; do
+      is_elf_path "$f" && bins+=("$f")
+      ((${#bins[@]} >= 12)) && break
+    done < <(find "$dir" -maxdepth 3 -type f -perm /111 -print0 2>/dev/null)
+  fi
+
+  local -A seen=()
+  local -a unique=()
+  for f in "${bins[@]}"; do
+    [[ ${seen[$f]+yes} ]] && continue
+    seen[$f]=1
+    unique+=("$f")
+    ((${#unique[@]} >= 12)) && break
+  done
+  bins=("${unique[@]}")
+
+  banner "Diagnose"
+  ui_h "Runtime compatibility · $DISP"
+  printf '  %s\n\n' "$(ui_c "$C_DIM" "folder  $(ui_tilde "$dir")")"
+  if [[ ! -d $dir ]]; then
+    warn "installation directory is missing"
+    return 1
+  fi
+  if [[ ! -x $LINK ]]; then
+    warn "registered launcher is missing or not executable: $LINK"
+    issues+=("launcher missing or not executable")
+    rc=1
+  else
+    ok "launcher exists and is executable"
+  fi
+
+  # Identify host architecture when file(1) is available.
+  host_arch=$(uname -m 2>/dev/null || printf unknown)
+  if ((${#bins[@]} == 0)); then
+    warn "no executable ELF binary found; this app may use a script, runtime, or launcher wrapper"
+    notes+=("no ELF entry point identified; static ELF checks were skipped")
+  fi
+
+  for f in "${bins[@]}"; do
+    scanned=$((scanned + 1))
+    info "checking ${f#"$dir"/}"
+
+    if command -v readelf >/dev/null 2>&1; then
+      arch=$(readelf -h "$f" 2>/dev/null | awk -F: '/Class:|Machine:/ {gsub(/^[[:space:]]+/, "", $2); printf "%s ", $2}')
+      if [[ -n $arch ]]; then
+        info "ELF: $arch"
+        case "$host_arch:$arch" in
+          x86_64:*AArch64*|x86_64:*ARM*) issues+=("${f#"$dir"/}: binary architecture may not match host ($host_arch)"); rc=1 ;;
+          aarch64:*X86-64*|aarch64:*Intel*) issues+=("${f#"$dir"/}: binary architecture may not match host ($host_arch)"); rc=1 ;;
+        esac
+      fi
+    else
+      notes+=("readelf unavailable; ELF architecture check skipped (install binutils)")
+    fi
+
+    # Include bundled library directories, matching common AppImage layouts.
+    out=$(env LD_LIBRARY_PATH="$dir/usr/lib:$dir/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      ldd -v "$f" 2>&1) || true
+    if grep -q 'not found' <<<"$out"; then
+      rc=1
+      while IFS= read -r line; do issues+=("${f#"$dir"/}: $line"); done \
+        < <(grep 'not found' <<<"$out")
+    fi
+    if grep -Eqi 'version .* not found|undefined symbol:' <<<"$out"; then
+      rc=1
+      while IFS= read -r line; do issues+=("${f#"$dir"/}: $line"); done \
+        < <(grep -Ei 'version .* not found|undefined symbol:' <<<"$out")
+    fi
+
+    # Detect GTK/GIO bundled against a host GLib.
+    local gtk_path gio_path glib_path
+    gtk_path=$(awk '/libgtk-3\.so/ && /=>/ {print $3; exit}' <<<"$out")
+    gio_path=$(awk '/libgio-2\.0\.so/ && /=>/ {print $3; exit}' <<<"$out")
+    glib_path=$(awk '/libglib-2\.0\.so/ && /=>/ {print $3; exit}' <<<"$out")
+    if [[ -n $glib_path && $glib_path != "$dir"/* ]] && \
+       { [[ $gtk_path == "$dir"/* ]] || [[ $gio_path == "$dir"/* ]]; }; then
+      rc=1
+      issues+=("${f#"$dir"/}: bundled GTK/GIO is mixed with host GLib ($glib_path)")
+    fi
+  done
+
+  # AppImage/GTK packaging hints. These are warnings, not proof of failure.
+  if [[ -d $dir/usr/lib/gio/modules ]]; then
+    notes+=("bundled GIO modules found; inspect module/library compatibility if logs mention GIO or GVFS")
+  elif [[ -d $dir/usr/lib && -n $(find "$dir/usr/lib" -maxdepth 1 -name 'libgio-2.0.so*' -print -quit 2>/dev/null) ]] &&
+       [[ -d /usr/lib/gio/modules ]]; then
+    notes+=("bundled GIO with host GIO modules present; host modules may be ABI-incompatible")
+  fi
+
+  local pixbuf_loader_dir=""
+  for path in "$dir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
+              "$dir/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders" \
+              "$dir/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders"; do
+    if [[ -d $path ]]; then pixbuf_loader_dir=$path; break; fi
+  done
+  if [[ -n $pixbuf_loader_dir ]]; then
+    cache=${pixbuf_loader_dir%/loaders}/loaders.cache
+    [[ -s $cache ]] || notes+=("GDK Pixbuf loaders exist but their loaders.cache is missing or empty")
+  elif [[ -d $dir/usr/lib && $(find "$dir/usr/lib" -type d -path '*/gdk-pixbuf-2.0/*/loaders' -print -quit 2>/dev/null) ]]; then
+    notes+=("GDK Pixbuf loader directory found in a non-standard location; cache path may need inspection")
+  fi
+
+  if [[ -d $dir/usr/lib/gtk-3.0 ]]; then
+    notes+=("bundled GTK 3 plugins detected; verify GTK_PATH and GTK_MODULES if GTK plugin errors appear")
+  fi
+  if [[ -f $dir/AppRun ]]; then
+    if head -c 256 "$dir/AppRun" 2>/dev/null | rg -q '(^|/)bin/(sh|bash)|^#!'; then
+      info "AppRun launcher wrapper detected"
+    else
+      notes+=("AppRun exists but its launcher type could not be identified")
+    fi
+  fi
+
+  printf '\n'
+  if ((${#issues[@]})); then
+    warn "potential runtime issues found across $scanned executable(s):"
+    printf '  • %s\n' "${issues[@]}"
+  elif ((scanned > 0)); then
+    ok "no missing libraries or obvious ELF/GTK split-runtime issue found in $scanned executable(s)"
+  fi
+  if ((${#notes[@]})); then
+    printf '\n'
+    ui_h "Additional checks / cautions"
+    printf '  • %s\n' "${notes[@]}"
+  fi
+  info "static inspection cannot guarantee a successful GUI launch; graphics, display backend, runtime-loaded plugins and application logic require an actual launch"
+  info "use 'kemas recover $app_name' to search for alternative packages if the app does not open"
+  return "$rc"
+}
+
+
+
+# Launch through Kemas to capture runtime diagnostics and offer recovery on failure.
+launch_app() {
+  local app_name=${1:-} log rc
+  [[ -n $app_name ]] || { warn "usage: kemas launch <app-command>"; return 2; }
+  reg_load "$app_name" || { warn "no Kemas registry entry for: $app_name"; return 1; }
+  [[ -x $LINK ]] || { warn "launcher is missing or not executable: $LINK"; return 1; }
+
+  log=$(mktemp "${TMPDIR:-/tmp}/kemas-launch.XXXXXX.log") || return 1
+  banner "Launch"
+  info "launching $DISP; runtime output: $log"
+  "$LINK" >"$log" 2>&1
+  rc=$?
+
+  printf '\n'
+  if ((rc == 0)); then
+    ok "process exited normally (status 0)"
+    info "a normal exit does not prove the GUI rendered correctly"
+    info "runtime log: $log"
+    return 0
+  fi
+
+  warn "application exited unsuccessfully (status $rc)"
+  if [[ -s $log ]]; then
+    ui_h "Runtime output (last 60 lines)"
+    tail -n 60 "$log"
+  else
+    info "application produced no stdout/stderr output"
+  fi
+  printf '\n'
+  if gum confirm "Search for alternative packages with Package Discovery?"; then
+    smart_recovery_app "$app_name"
+  else
+    info "recovery skipped; log preserved at $log"
+  fi
+  return "$rc"
+}
+
+# ---------- package discovery / smart recovery ----------
+detect_platform() {
+  local id="" like=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    id=${ID:-}
+    like=${ID_LIKE:-}
+  fi
+  printf '%s\n' "$id $like" | tr '[:upper:]' '[:lower:]'
+}
+
+package_discovery() {
+  local query=${1:-} platform="" choice="" source="" pkg="" confirm=""
+  local line repo name desc appid q search_label
+  local -a labels=() pkgs=() sources=() queries=()
+  [[ -n $query ]] || { warn "usage: kemas discover <app-name>"; return 2; }
+  platform=$(detect_platform)
+
+  # Accept additional search terms after the first argument. Recovery uses
+  # command name + display-name tokens; normal `discover` remains one query.
+  shift || true
+  queries=("$query" "$@")
+
+  add_candidate() {
+    local label=$1 package=$2 origin=$3 existing
+    [[ -n $package ]] || return
+    # Avoid duplicate rows caused by overlapping search terms, but preserve
+    # the same package when it comes from different sources (repo vs AUR).
+    for existing in "${!pkgs[@]}"; do
+      [[ ${pkgs[$existing]} == "$package" && ${sources[$existing]} == "$origin" ]] && return
+    done
+    labels+=("$label")
+    pkgs+=("$package")
+    sources+=("$origin")
+  }
+
+  banner "Package discovery"
+  search_label=$(IFS=', '; printf '%s' "${queries[*]}")
+  ui_h "Package discovery · $search_label"
+  printf '  %s\n' "$(ui_c "$C_DIM" "platform  ${platform:-unknown}")"
+  info "Search results are suggestions. Nothing is installed without your confirmation."
+  printf '\n'
+
+  for q in "${queries[@]}"; do
+    [[ -n $q ]] || continue
+    case " $platform " in
+      *" arch "*|*" cachyos "*|*" manjaro "*|*" endeavouros "*)
+        if command -v pacman >/dev/null; then
+          while IFS= read -r line; do
+            [[ $line =~ ^([^/]+)/([^[:space:]]+)[[:space:]]+([^[:space:]]+) ]] || continue
+            repo=${BASH_REMATCH[1]}; name=${BASH_REMATCH[2]}
+            add_candidate "[Official Repo] $name ${BASH_REMATCH[3]} ($repo)" "$name" pacman
+          done < <(pacman -Ss -- "$q" 2>/dev/null)
+        fi
+        if command -v paru >/dev/null; then
+          while IFS= read -r line; do
+            [[ $line =~ ^(aur)/([^[:space:]]+)[[:space:]]+([^[:space:]]+) ]] || continue
+            name=${BASH_REMATCH[2]}
+            add_candidate "[AUR] $name ${BASH_REMATCH[3]}" "$name" paru
+          done < <(paru -Ss -- "$q" 2>/dev/null)
+        fi ;;
+      *" debian "*|*" ubuntu "*|*" linuxmint "*|*" pop "*|*" elementary "*)
+        if command -v apt-cache >/dev/null; then
+          while IFS= read -r line; do
+            [[ $line == *" - "* ]] || continue
+            name=${line%% - *}
+            add_candidate "[Official Repo] $line" "$name" apt
+          done < <(apt-cache search -- "$q" 2>/dev/null)
+        fi ;;
+      *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*)
+        if command -v dnf >/dev/null; then
+          while IFS= read -r line; do
+            [[ $line =~ ^([^[:space:]]+)\.([^.[:space:]]+)[[:space:]]+:[[:space:]]+(.+)$ ]] || continue
+            name=${BASH_REMATCH[1]}
+            add_candidate "[Official Repo] $name — ${BASH_REMATCH[3]}" "$name" dnf
+          done < <(dnf -q search "$q" 2>/dev/null)
+        fi ;;
+      *" opensuse "*|*" suse "*|*" sles "*)
+        if command -v zypper >/dev/null; then
+          while IFS= read -r line; do
+            [[ $line =~ ^[[:space:]]*\|[[:space:]]*([^[:space:]]+)[[:space:]]*\| ]] || continue
+            name=${BASH_REMATCH[1]}
+            [[ $name == Name ]] && continue
+            add_candidate "[Official Repo] $name" "$name" zypper
+          done < <(zypper --no-refresh search -- "$q" 2>/dev/null)
+        fi ;;
+      *)
+        warn "unsupported distro family; native package search skipped" ;;
+    esac
+
+    if command -v flatpak >/dev/null && flatpak remotes --columns=name 2>/dev/null | rg -qx 'flathub'; then
+      while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        appid=${line%%[[:space:]]*}
+        add_candidate "[Flathub] $line" "$appid" flatpak
+      done < <(flatpak remote-ls --app --columns=application,name flathub 2>/dev/null | rg -i --fixed-strings -- "$q" || true)
+    fi
+  done
+
+  if command -v flatpak >/dev/null && ! flatpak remotes --columns=name 2>/dev/null | rg -qx 'flathub'; then
+    info "Flatpak is installed, but Flathub is not configured"
+  elif ! command -v flatpak >/dev/null; then
+    info "Flatpak is not installed"
+  fi
+
+  if ((${#labels[@]} == 0)); then
+    warn "no matching packages found in the detected sources"
+    return 0
+  fi
+
+  printf '\n'
+  choice=$(printf '%s\n' "${labels[@]}" "← done" | gum choose --header "Select a package to install") || return 0
+  [[ $choice == "← done" ]] && return 0
+
+  local i
+  for i in "${!labels[@]}"; do
+    if [[ ${labels[$i]} == "$choice" ]]; then
+      pkg=${pkgs[$i]}
+      source=${sources[$i]}
+      break
+    fi
+  done
+  [[ -n $pkg && -n $source ]] || { warn "could not resolve selected package"; return 1; }
+
+  case $source in
+    pacman) confirm="sudo pacman -S $pkg" ;;
+    paru) confirm="paru -S $pkg" ;;
+    apt) confirm="sudo apt install $pkg" ;;
+    dnf) confirm="sudo dnf install $pkg" ;;
+    zypper) confirm="sudo zypper install $pkg" ;;
+    flatpak) confirm="flatpak install flathub $pkg" ;;
+    *) warn "unknown package source"; return 1 ;;
+  esac
+
+  printf '\n'
+  ui_h "Selected · $choice"
+  info "Install command: $confirm"
+  if gum confirm "Run this installation command now?"; then
+    case $source in
+      pacman) sudo pacman -S -- "$pkg" ;;
+      paru) paru -S -- "$pkg" ;;
+      apt) sudo apt install "$pkg" ;;
+      dnf) sudo dnf install "$pkg" ;;
+      zypper) sudo zypper install "$pkg" ;;
+      flatpak) flatpak install flathub "$pkg" ;;
+    esac
+    if pkg_installed "$source" "$pkg"; then
+      pkg_reg_save "$source" "$pkg"
+      ok "$pkg is now tracked: Installed apps → Installed with kemas"
+    fi
+  else
+    info "installation cancelled"
+  fi
+  return 0
+}
+
+smart_recovery_app() {
+  local app_name=${1:-} query display token
+  local -a queries=()
+  [[ -n $app_name ]] || { warn "usage: kemas recover <app-command>"; return 2; }
+
+  if reg_load "$app_name"; then
+    # Search automatically using the registered command and meaningful
+    # display-name tokens. Do not force manual upstream-package input.
+    queries+=("$NAME")
+    display=${DISP:-$NAME}
+    while IFS= read -r token; do
+      [[ -n $token ]] || continue
+      # Skip generic words that tend to produce noisy package results.
+      case ${token,,} in
+        app|application|desktop|linux|client|launcher|tool|utility|usb|flasher) continue ;;
+      esac
+      queries+=("$token")
+    done < <(printf '%s' "$display" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | sed '/^$/d')
+    if [[ -n ${PACKAGE:-} ]]; then
+      queries+=("$PACKAGE")
+    fi
+  else
+    queries+=("$app_name")
+  fi
+
+  # Remove repeated query terms while preserving their order.
+  local -a unique_queries=()
+  local item seen
+  for item in "${queries[@]}"; do
+    seen=0
+    for token in "${unique_queries[@]}"; do
+      [[ ${token,,} == "${item,,}" ]] && { seen=1; break; }
+    done
+    ((seen)) || unique_queries+=("$item")
+  done
+
+  if ((${#unique_queries[@]} == 0)); then
+    warn "could not determine a useful package search term"
+    return 0
+  fi
+
+  info "Recovery search terms: ${unique_queries[*]}"
+  package_discovery "${unique_queries[@]}"
+}
+# ---------- settings ----------
+pick_font() {
+  command -v fc-list >/dev/null || { warn "fc-list not found (fontconfig)"; return; }
+  local all reg line
+  all=$(fc-list --format '%{family[0]}|%{style[0]}|%{file}\n' | sort -u)
+  reg=$(grep -iE '\|(regular|book|roman|normal)\|' <<<"$all")
+  [[ -n $reg ]] && all=$reg
+  line=$(awk -F'|' '!s[$1]++ {print $1 "|" $3}' <<<"$all" | gum filter --placeholder "search fonts...") || return
+  C[ICON_FONT_NAME]=${line%%|*}
+  C[ICON_FONT]=${line#*|}
+  save_cfg
+  ok "letter icon font: ${C[ICON_FONT_NAME]}"
+}
+
+pick_hex() {
+  local key=$1 label=$2 v
+  v=$(ask "$label (#rrggbb):" "${C[$key]}") || return
+  if [[ $v =~ ^#[0-9a-fA-F]{6}$ ]]; then C[$key]=$v; save_cfg; ok "$label = $v"; else warn "format must be #rrggbb"; fi
+}
+
+settings() {
+  local ch v
+  while :; do
+    banner "Settings"
+    ch=$(menu_pick "Settings" \
+      "folder|Package source folder  [${C[SRC_DIR]}]" \
+      "font|Letter icon font       [${C[ICON_FONT_NAME]:-default}]" \
+      "color|Icon background color  [${C[ICON_BG]}]" \
+      "color|Icon letter color      [${C[ICON_FG]}]" \
+      "accent|TUI accent color       [${C[ACCENT]}]" \
+      "style|Interface style        [${C[UI_STYLE]:-clean}]" \
+      "back|← back") || return
+    case $ch in
+      "Package source"*)
+        v=$(ask "Source folder:" "${C[SRC_DIR]}") || continue
+        v=${v/#\~/$HOME}
+        if [[ -d $v ]]; then C[SRC_DIR]=$v; save_cfg; else warn "not a folder: $v"; sleep 1; fi ;;
+      "Letter icon font"*) pick_font; sleep 1 ;;
+      "Icon background"*) pick_hex ICON_BG "Icon background color"; sleep 1 ;;
+      "Icon letter"*) pick_hex ICON_FG "Icon letter color"; sleep 1 ;;
+      "TUI accent"*)
+        v=$(ask "Accent (auto, ANSI 0-255, or #rrggbb):" "${C[ACCENT]}") || continue
+        if [[ $v == auto || $v =~ ^#[0-9a-fA-F]{6}$ || ( $v =~ ^[0-9]{1,3}$ && $v -le 255 ) ]]; then C[ACCENT]=$v; save_cfg; theme; else warn "auto, 0-255, or #rrggbb"; sleep 1; fi ;;
+      "Interface style"*)
+        if [[ ${C[UI_STYLE]:-clean} == nerd ]]; then C[UI_STYLE]=clean; else C[UI_STYLE]=nerd; fi
+        save_cfg
+        ok "interface style: ${C[UI_STYLE]} (nerd needs a Nerd Font in your terminal)"
+        sleep 1.5 ;;
+      *) return ;;
+    esac
+  done
+}
+
+# ---------- main ----------
+first_run() {
+  banner
+  local w d
+  w=$(ui_cols)
+  ui_box "$ACC" "$w" "$(ui_b "Welcome to kemas")" "" \
+    "Where do you usually keep downloaded packages?" \
+    "$(ui_c "$C_DIM" "tar.gz · zip · .deb · AppImage. Change it later in Settings.")"
+  printf '\n'
+  d=$(ask "Folder:" "${C[SRC_DIR]}" "~/Downloads") || d=${C[SRC_DIR]}
+  d=${d/#\~/$HOME}
+  if [[ -d $d ]]; then C[SRC_DIR]=$d; else warn "$d is not a folder, using ${C[SRC_DIR]}"; fi
+  save_cfg
+  ok "saved to $CFG"
+  sleep 1
+}
+
+menu() {
+  local ch u
+  while :; do
+    banner
+    ch=$(menu_pick "What do you want to do?" \
+      "install|Install a new package" "url|Install from URL" "apps|Installed apps" "config|Config & data" \
+      "discover|Package discovery" "leftover|Leftover data" "settings|Settings" "quit|Quit") || return 0
+    case $ch in
+      "Install a new package") banner "Install"; do_install; ui_pause ;;
+      "Install from URL")
+        banner "Install" "From URL"
+        u=$(ask "URL:" "" "direct link, or https://github.com/user/repo/releases") || continue
+        [[ -n $u ]] && install_from_url "$u"
+        ui_pause ;;
+      "Installed apps") manage_apps ;;
+      "Config & data") config_menu ;;
+      "Package discovery")
+        banner "Package discovery"
+        u=$(ask "Search application name:" "" "e.g. popsicle") || u=""
+        [[ -n $u ]] && package_discovery "$u"
+        ui_pause ;;
+      "Leftover data") cleanup_menu ;;
+      Settings) settings ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+kemas — install prebuilt packages (tar.gz/tar.xz/tar.zst/zip) as desktop apps
+
+  kemas                   interactive menu
+  kemas <archive>         install that archive directly
+  kemas <url>             download, then install (direct link, or a GitHub
+                          repo / releases page -> pick an asset)
+  kemas -h                show this help
+  kemas cleanup           manage data left behind by removed apps
+  Config & data           manage persistent and filesystem-discovered app data from the menu
+  kemas diagnose <app>    inspect installation, runtime dependencies and compatibility hints
+  kemas check <app>       alias for diagnose (backward compatibility)
+  kemas launch <app>      launch through Kemas and capture runtime errors
+  kemas discover <query>  search native repositories and Flatpak remotes
+  kemas recover <app>     find package alternatives for an installed app
+
+layout : ~/.local/opt/<name>  ->  symlink ~/.local/bin/<name>  +  .desktop  +  icon
+config : $CFG
+EOF
+}
+
+main() {
+  case ${1:-} in -h | --help) usage; return 0 ;; esac
+  command -v gum >/dev/null || { needs_tool gum; return 1; }
+  ui_gum_wrap
+  load_cfg
+  theme
+  [[ -f $CFG ]] || first_run
+  case ${1:-} in
+    cleanup) cleanup_menu ;;
+    diagnose | check) runtime_check_app "${2:-}" ;;
+    launch) launch_app "${2:-}" ;;
+    discover) package_discovery "${2:-}" ;;
+    recover) smart_recovery_app "${2:-}" ;;
+    "") menu ;;
+    *) banner "Install"; if is_url "$1"; then install_from_url "$1"; else do_install "$1"; fi ;;
+  esac
+}
+
+[[ ${KEMAS_LIB:-0} == 1 ]] && return 0 2>/dev/null
+main "$@"
