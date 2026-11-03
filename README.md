@@ -18,7 +18,47 @@ Install applications from `.tar.gz`, `.tar.xz`, `.tar.zst`, and `.zip` archives 
 
 ## Installation
 
-Installation instructions will be added here.
+### Requirements
+
+- Linux
+- Bash
+- `curl` (for URL downloads)
+- `gum` (for the interactive interface)
+
+### Install from GitHub
+
+Clone the repository and run the installer:
+
+```bash
+git clone https://github.com/Nirune/Kemas.git
+cd Kemas
+./install.sh
+```
+
+Kemas will be installed to:
+
+- Executable: `~/.local/opt/kemas/kemas`
+- Command symlink: `~/.local/bin/kemas`
+
+Make sure `~/.local/bin` is included in your `PATH`.
+
+### Verify Installation
+
+```bash
+kemas --help
+```
+
+### Update
+
+Pull the latest source and run the installer again:
+
+```bash
+cd Kemas
+git pull
+./install.sh
+```
+
+The installer updates the executable without removing your existing configuration or application data.
 
 ## Usage
 
