@@ -1959,6 +1959,15 @@ package_discovery() {
             add_candidate "[Official Repo] $name ${BASH_REMATCH[3]} ($repo)" "$name" pacman
           done < <(pacman -Ss -- "$q" 2>/dev/null)
         fi
+
+        if command -v flatpak >/dev/null && flatpak remotes --columns=name 2>/dev/null | rg -qx 'flathub'; then
+          while IFS=$'\t' read -r appid name; do
+            [[ -n $appid ]] || continue
+            [[ -z "$name" ]] && name="$appid"
+            add_candidate "[Flathub] $name" "$appid" flatpak
+          done < <({ flatpak remote-ls --app --columns=application,name --system flathub 2>/dev/null; flatpak remote-ls --app --columns=application,name --user flathub 2>/dev/null; } | sort -u | rg -i --fixed-strings -- "$q" || true)
+        fi
+
         if command -v paru >/dev/null; then
           while IFS= read -r line; do
             [[ $line =~ ^(aur)/([^[:space:]]+)[[:space:]]+([^[:space:]]+) ]] || continue
@@ -1994,14 +2003,6 @@ package_discovery() {
       *)
         warn "unsupported distro family; native package search skipped" ;;
     esac
-
-    if command -v flatpak >/dev/null && flatpak remotes --columns=name 2>/dev/null | rg -qx 'flathub'; then
-      while IFS= read -r line; do
-        [[ -n $line ]] || continue
-        appid=${line%%[[:space:]]*}
-        add_candidate "[Flathub] $line" "$appid" flatpak
-      done < <(flatpak remote-ls --app --columns=application,name flathub 2>/dev/null | rg -i --fixed-strings -- "$q" || true)
-    fi
   done
 
   if command -v flatpak >/dev/null && ! flatpak remotes --columns=name 2>/dev/null | rg -qx 'flathub'; then
@@ -2035,7 +2036,7 @@ package_discovery() {
     apt) confirm="sudo apt install $pkg" ;;
     dnf) confirm="sudo dnf install $pkg" ;;
     zypper) confirm="sudo zypper install $pkg" ;;
-    flatpak) confirm="flatpak install flathub $pkg" ;;
+    flatpak) confirm="flatpak install --user flathub $pkg" ;;
     *) warn "unknown package source"; return 1 ;;
   esac
 
@@ -2049,7 +2050,7 @@ package_discovery() {
       apt) sudo apt install "$pkg" ;;
       dnf) sudo dnf install "$pkg" ;;
       zypper) sudo zypper install "$pkg" ;;
-      flatpak) flatpak install flathub "$pkg" ;;
+      flatpak) flatpak install --user -y flathub "$pkg" ;;
     esac
     if pkg_installed "$source" "$pkg"; then
       pkg_reg_save "$source" "$pkg"
