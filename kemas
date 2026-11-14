@@ -51,7 +51,7 @@ save_cfg() {
 # follows whatever your terminal theme is (kitty, foot, alacritty, ...).
 # No dependency on any theme tool. A color is either a bare ANSI/256 number ("5")
 # or a truecolor hex ("#rrggbb"); both work in ui_c and gum.
-ACC=5
+ACC=6
 C_DIM=8
 C_TXT=7
 C_OK=2
@@ -75,8 +75,8 @@ theme() {
   ACC=$(accent)
   UI_HOST=$( [[ -r /etc/os-release ]] && . /etc/os-release && printf '%s' "${ID:-linux}" )
   UI_HOST=${UI_HOST:-linux}
-  export GUM_CHOOSE_CURSOR="  █ " GUM_CHOOSE_CURSOR_FOREGROUND="$ACC" GUM_CHOOSE_SELECTED_FOREGROUND="$ACC"
-  export GUM_CHOOSE_SELECTED_PREFIX="[x] " GUM_CHOOSE_UNSELECTED_PREFIX="[ ] "
+  export GUM_CHOOSE_CURSOR="  ▸ " GUM_CHOOSE_CURSOR_FOREGROUND="$ACC" GUM_CHOOSE_SELECTED_FOREGROUND="$ACC"
+  export GUM_CHOOSE_SELECTED_PREFIX=" ✓ " GUM_CHOOSE_UNSELECTED_PREFIX=" ○ "
   export GUM_CHOOSE_HEADER_FOREGROUND="$ACC"
   export GUM_FILTER_PROMPT="  > " GUM_FILTER_PROMPT_FOREGROUND="$ACC"
   export GUM_FILTER_INDICATOR="  █" GUM_FILTER_INDICATOR_FOREGROUND="$ACC" GUM_FILTER_MATCH_FOREGROUND="$ACC"
@@ -208,13 +208,14 @@ ui_gum_wrap() {
 ui_hero() {
   local w=$1 inner=$(($1 - 4)) line pad lp rp
   local -a lines=(
-    "$(ui_b "$(ui_c "$ACC" "✦ K E M A S ✦")")"
-    "$(ui_b "$(ui_c "$ACC" "A L L  I N  O N E")")"
     ""
-    "$(ui_c "$C_DIM" "▸") $(ui_b "$(ui_c "$ACC" "PACKAGE MANAGER")") $(ui_c "$C_DIM" "◂")"
+    "$(ui_b "$(ui_c "$ACC" "✦    K  E  M  A  S    ✦")")"
+    "$(ui_c "$C_DIM" "───────────────────────────────────────────────")"
+    "$(ui_c "$C_TXT" "One command, every format.")"
     ""
-    "$(ui_c "$C_DIM" "TAR · ZIP · DEB · APPIMAGE")"
-    "$(ui_c "$C_DIM" "PACMAN · AUR · APT · DNF · FLATPAK")"
+    "$(ui_c "$ACC" "●") $(ui_c "$C_TXT" "  tarball  ") $(ui_c "$C_DIM" "→") $(ui_b "$(ui_c "$ACC" " desktop app")")"
+    "$(ui_c "$ACC" "●") $(ui_c "$C_TXT" "  diagnose ") $(ui_c "$C_DIM" "·") $(ui_c "$C_TXT" " launch ") $(ui_c "$C_DIM" "·") $(ui_c "$C_TXT" " discover ") $(ui_c "$C_DIM" "·") $(ui_c "$C_TXT" " recover")"
+    ""
   )
   printf '  %s\n' "$(ui_c "$ACC" "╭$(ui_rep $((w - 2)) ─)╮")"
   for line in "${lines[@]}"; do
@@ -225,7 +226,7 @@ ui_hero() {
   printf '  %s\n' "$(ui_c "$ACC" "╰$(ui_rep $((w - 2)) ─)╯")"
 }
 
-# banner [section [subsection...]]: inverted title bar + stats + breadcrumb
+# banner [section [subsection...]]: gradient title bar + stats + breadcrumb
 banner() {
   local w apps kept left right pad stats crumb s i=0 n=$#
   w=$(ui_cols)
@@ -235,19 +236,19 @@ banner() {
   clear
   printf '\n'
   if (($# == 0)); then ui_hero "$w"; printf '\n'; fi
-  left=" KEMAS  TARBALL → DESKTOP"
-  right="${UI_HOST^^} "
+  left=" ✦ KEMAS"
+  right="${UI_HOST^^} ✦ "
   pad=$((w - ${#left} - ${#right})); ((pad < 1)) && pad=1
   printf '  %s\n' "$(ui_inv "$ACC" "$C_ON_ACCENT" "$left$(printf '%*s' "$pad" '')$right")"
-  stats="$(ui_b "$(ui_c "$ACC" "$apps")") $(ui_c "$C_DIM" APPS) $(ui_c "$C_DIM" ┃) $(ui_b "$(ui_c "$ACC" "$kept")") $(ui_c "$C_DIM" LEFTOVER) $(ui_c "$C_DIM" ┃) $(ui_c "$C_DIM" "SRC $(ui_fit $((w - 30)) "$(ui_tilde "${C[SRC_DIR]}")")")"
+  stats="  $(ui_b "$(ui_c "$ACC" "●  $apps")") $(ui_c "$C_DIM" apps)    $(ui_b "$(ui_c "$ACC" "●  $kept")") $(ui_c "$C_DIM" leftover)    $(ui_c "$C_DIM" "◈ src ")$(ui_c "$C_TXT" "$(ui_fit $((w - 34)) "$(ui_tilde "${C[SRC_DIR]}")")")"
   printf '  %s\n' "$stats"
-  printf '  %s\n' "$(ui_c "$C_DIM" "$(ui_rep "$w" ━)")"
+  printf '  %s\n' "$(ui_c "$C_DIM" "$(ui_rep "$w" ─)")"
   if (($#)); then
-    crumb="$(ui_c "$C_DIM" HOME)"
+    crumb="$(ui_c "$C_DIM" "◂ home")"
     for s in "$@"; do
       i=$((i + 1))
-      if ((i == n)); then crumb+=" $(ui_c "$C_DIM" /) $(ui_b "$(ui_c "$ACC" "${s^^}")")"
-      else crumb+=" $(ui_c "$C_DIM" /) $(ui_c "$C_DIM" "${s^^}")"; fi
+      if ((i == n)); then crumb+="  $(ui_c "$C_DIM" "·")  $(ui_b "$(ui_c "$ACC" "${s^^}")")"
+      else crumb+="  $(ui_c "$C_DIM" "·")  $(ui_c "$C_DIM" "${s^^}")"; fi
     done
     printf '  %s\n' "$crumb"
   fi
@@ -323,7 +324,7 @@ ui_pause() {
 ui_h() {
   local t="${*^^}" n
   n=$(($(ui_cols) - ${#t} - 5)); ((n < 3)) && n=3
-  printf '\n  %s %s\n' "$(ui_b "$(ui_c "$ACC" "■ $t")")" "$(ui_c "$C_DIM" "$(ui_rep "$n" ━)")"
+  printf '\n  %s %s %s\n' "$(ui_c "$ACC" "●")" "$(ui_b "$(ui_c "$C_TXT" "$t")")" "$(ui_c "$C_DIM" "$(ui_rep "$n" ─)")"
 }
 ui_next() { printf '  %s %s  %s\n' "$(ui_c "$C_DIM" '$')" "$(ui_c "$ACC" "$1")" "$(ui_c "$C_DIM" "// $2")"; }
 ui_result() {   # ui_result <title> <key|value>...
@@ -345,9 +346,9 @@ menu_pick() {
   for item in "$@"; do
     lab=${item#*|}
     labels+=("$lab")
-    if [[ $lab == "← "* ]]; then disp+=("   $lab"); else disp+=("$(ui_ico "${item%%|*}")  $lab"); fi
+    if [[ $lab == "← "* ]]; then disp+=("      $lab"); else disp+=("  $(ui_ico "${item%%|*}")  $lab"); fi
   done
-  out=$(gum choose --header "■ $header" "${disp[@]}") || return 1
+  out=$(gum choose --header "  ● $header" "${disp[@]}") || return 1
   for i in "${!disp[@]}"; do
     if [[ ${disp[i]} == "$out" ]]; then printf '%s' "${labels[i]}"; return 0; fi
   done
