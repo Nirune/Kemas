@@ -1712,6 +1712,47 @@ manage_apps() {
   done
 }
 
+# list_installed [all|with-kemas|outside]: non-interactive listing for `kemas installed`
+list_installed() {
+  local mode=${1:-all} n f src pkg label state count=0
+  local -a apps=() pfiles=()
+  if [[ $mode == all || $mode == with-kemas ]]; then
+    mapfile -t apps < <(find "$REG_DIR" -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null | sed 's/\.conf$//' | sort)
+    mapfile -t pfiles < <(find "$PKG_REG_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | sort)
+    ui_h "Installed with kemas"
+    if ((${#apps[@]} + ${#pfiles[@]} == 0)); then
+      printf '  %s\n' "$(ui_c "$C_DIM" "nothing installed through kemas yet")"
+    else
+      for n in "${apps[@]}"; do
+        reg_load "$n" || continue
+        if [[ -x $LINK && -d $DIR ]]; then state="$(ui_c "$C_OK" "●")"; else state="$(ui_c "$C_ERR" "✖")"; fi
+        printf '  %s %-20s %s\n' "$state" "$(ui_fit 20 "$n")" "$(ui_c "$C_DIM" "${DISP:-$n}")"
+        count=$((count + 1))
+      done
+      for f in "${pfiles[@]}"; do
+        pkg_reg_load "$f" || continue
+        if pkg_installed "$P_SRC" "$P_NAME"; then state="$(ui_c "$C_OK" "●")"; else state="$(ui_c "$C_ERR" "✖")"; fi
+        printf '  %s %-20s %s\n' "$state" "$(ui_fit 20 "$P_NAME")" "$(ui_c "$C_DIM" "[$P_SRC]")"
+        count=$((count + 1))
+      done
+    fi
+  fi
+  if [[ $mode == all || $mode == outside ]]; then
+    ui_h "Installed outside kemas"
+    while IFS=$'\t' read -r src pkg label; do
+      [[ -n $pkg ]] || continue
+      printf '  %s %-20s %s\n' "$(ui_c "$C_DIM" "○")" "$(ui_fit 20 "$pkg")" "$(ui_c "$C_DIM" "[$src]")"
+      count=$((count + 1))
+    done < <(outside_scan apps 2>/dev/null)
+  fi
+  printf '\n'
+  if ((count == 0)); then
+    printf '  %s\n' "$(ui_c "$C_DIM" "no matching applications found")"
+  else
+    printf '  %s %s %s\n' "$(ui_b "$(ui_c "$ACC" "$count")")" "$(ui_c "$C_DIM" "total ·")" "$(ui_c "$C_DIM" "● ready  ✖ broken  ○ outside")"
+  fi
+}
+
 # ---------- runtime compatibility ----------
 # Static-ish runtime check for an installed app. Uses ldd on executable ELF files;
 # only run this on apps the user chose to install (ldd is not a safe parser for hostile binaries).
@@ -2209,18 +2250,21 @@ usage() {
   cat <<EOF
 kemas — install prebuilt packages (tar.gz/tar.xz/tar.zst/zip) as desktop apps
 
-  kemas                   interactive menu
-  kemas <archive>         install that archive directly
-  kemas <url>             download, then install (direct link, or a GitHub
-                          repo / releases page -> pick an asset)
-  kemas -h                show this help
-  kemas cleanup           manage data left behind by removed apps
-  Config & data           manage persistent and filesystem-discovered app data from the menu
-  kemas diagnose <app>    inspect installation, runtime dependencies and compatibility hints
-  kemas check <app>       alias for diagnose (backward compatibility)
-  kemas launch <app>      launch through Kemas and capture runtime errors
-  kemas discover <query>  search native repositories and Flatpak remotes
-  kemas recover <app>     find package alternatives for an installed app
+  kemas                     interactive menu
+  kemas <archive>           install that archive directly
+  kemas <url>               download, then install (direct link, or a GitHub
+                            repo / releases page -> pick an asset)
+  kemas -h                  show this help
+  kemas installed           list all installed applications
+  kemas installed --with-kemas  list apps installed with kemas only
+  kemas installed --outside     list apps installed outside kemas only
+  kemas cleanup             manage data left behind by removed apps
+  Config & data             manage persistent and filesystem-discovered app data from the menu
+  kemas diagnose <app>      inspect installation, runtime dependencies and compatibility hints
+  kemas check <app>         alias for diagnose (backward compatibility)
+  kemas launch <app>        launch through Kemas and capture runtime errors
+  kemas discover <query>    search native repositories and Flatpak remotes
+  kemas recover <app>       find package alternatives for an installed app
 
 layout : ~/.local/opt/<name>  ->  symlink ~/.local/bin/<name>  +  .desktop  +  icon
 config : $CFG
@@ -2239,6 +2283,13 @@ main() {
     diagnose | check) runtime_check_app "${2:-}" ;;
     launch) launch_app "${2:-}" ;;
     discover) package_discovery "${2:-}" ;;
+    installed)
+      case ${2:-all} in
+        ""|all|--all) list_installed all ;;
+        --with-kemas|with-kemas|kemas) list_installed with-kemas ;;
+        --outside|outside) list_installed outside ;;
+        *) warn "usage: kemas installed [--with-kemas|--outside]"; return 2 ;;
+      esac ;;
     recover) smart_recovery_app "${2:-}" ;;
     "") menu ;;
     *) banner "Install"; if is_url "$1"; then install_from_url "$1"; else do_install "$1"; fi ;;
