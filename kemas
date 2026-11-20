@@ -6,6 +6,7 @@
 # usage   : kemas                  -> menu
 #           kemas package.tar.gz   -> install that file directly
 #           kemas <url>            -> download first (direct link or GitHub repo / releases page)
+KEMAS_VERSION="0.1.0"
 set -uo pipefail
 
 APP="kemas"
@@ -135,6 +136,82 @@ ui_cols() {
   ((w > 74)) && w=74
   ((w < 40)) && w=40
   printf '%d' $((w - 2))
+}
+
+# human size: ui_bytes <bytes> -> 12.3M   (bfmt assigns instead of printing: no fork)
+bfmt() {
+  local b=${2:-0} u
+  [[ $b =~ ^[0-9]+$ ]] || b=0
+  if ((b >= 1073741824)); then u=$(( (b % 1073741824) * 10 / 1073741824 )); printf -v "$1" '%d.%dG' $((b / 1073741824)) "$u"
+  elif ((b >= 1048576)); then u=$(( (b % 1048576) * 10 / 1048576 )); printf -v "$1" '%d.%dM' $((b / 1048576)) "$u"
+  elif ((b >= 1024)); then u=$(( (b % 1024) * 10 / 1024 )); printf -v "$1" '%d.%dK' $((b / 1024)) "$u"
+  else printf -v "$1" '%dB' "$b"; fi
+}
+ui_bytes() { local _s; bfmt _s "$1"; printf '%s' "$_s"; }
+
+# clock: ui_clock <seconds> -> 04:07   (cfmt assigns instead of printing: no fork)
+cfmt() {
+  local s=${2:-0}
+  [[ $s =~ ^[0-9]+$ ]] || s=0
+  printf -v "$1" '%02d:%02d' $((s / 60)) $((s % 60))
+}
+ui_clock() { local _s; cfmt _s "$1"; printf '%s' "$_s"; }
+
+# ui_dl_bar <done> <total> <speed B/s> <elapsed s> <phase> [cols]
+#   Redraws the download line in place on stderr (carriage return, no newline).
+#   total = 0 -> indeterminate striped bar: sizes + speed + elapsed, no percentage / ETA.
+#   cols is optional (avoids re-querying the terminal width every frame).
+ui_dl_bar() {
+  local done=${1:-0} total=${2:-0} speed=${3:-0} el=${4:-0} phase=${5:-0} cols=${6:-}
+  local -a PARTIAL=('▏' '▎' '▍' '▌' '▋' '▊' '▉')
+  local bw pos fill frac idx=0 pct=0 plain right speed_txt eta_txt s_done="" s_tot="" out ea="" eb="" a1="" rs="" i
+  [[ $done =~ ^[0-9]+$ ]] || done=0
+  [[ $total =~ ^[0-9]+$ ]] || total=0
+  [[ $speed =~ ^[0-9]+$ ]] || speed=0
+  [[ $el =~ ^[0-9]+$ ]] || el=0
+  [[ -z ${NO_COLOR:-} ]] && { ea=$(ui_esc fg "$ACC"); eb=$(ui_esc fg "$C_DIM"); a1=$'\e[1m'; rs=$'\e[0m'; }
+
+  bfmt s_done "$done"
+  if ((speed > 0)); then bfmt speed_txt "$speed"; speed_txt="$speed_txt/s"; else speed_txt="--"; fi
+  if ((total > 0)); then
+    bfmt s_tot "$total"
+    pct=$((done * 100 / total)); ((pct > 100)) && pct=100
+    if ((speed > 0 && done < total)); then cfmt eta_txt $(((total - done) / speed)); eta_txt="ETA $eta_txt"; else eta_txt="ETA --:--"; fi
+    plain="$s_done/$s_tot  $pct%  $speed_txt  $eta_txt"
+    printf -v right '%s%s%s  %s%s%s%s  %s%s%s  %s%s%s' \
+      "$eb" "$s_done/$s_tot" "$rs" "$a1" "$ea" "$pct%" "$rs" "$eb" "$speed_txt" "$rs" "$eb" "$eta_txt" "$rs"
+  else
+    cfmt eta_txt "$el"
+    plain="$s_done  $speed_txt  $eta_txt"
+    printf -v right '%s%s%s  %s%s%s  %s%s%s' \
+      "$eb" "$s_done" "$rs" "$eb" "$speed_txt" "$rs" "$eb" "$eta_txt" "$rs"
+  fi
+  [[ -z $cols ]] && cols=$(ui_cols)
+  bw=$((cols - 2 - ${#plain}))
+  if ((bw < 10 && total > 0)); then   # narrow terminal: keep bar + percentage, drop speed/eta
+    plain="$s_done/$s_tot  $pct%"
+    printf -v right '%s%s%s  %s%s%s%s' "$eb" "$s_done/$s_tot" "$rs" "$a1" "$ea" "$pct%" "$rs"
+    bw=$((cols - 2 - ${#plain}))
+  fi
+  ((bw < 8)) && bw=8
+  ((bw > 64)) && bw=64
+
+  if ((total > 0)); then
+    pos=$((done * bw * 100 / total)); ((pos > bw * 100)) && pos=$((bw * 100))
+    fill=$((pos / 100)); frac=$((pos % 100))
+    if ((frac > 0)); then idx=$(((frac * 7 + 99) / 100)); ((idx > 7)) && idx=7; fi
+    for ((i = 0; i < bw; i++)); do
+      if ((i < fill)); then out+="${ea}█"
+      elif ((i == fill && frac > 0)); then out+="${ea}${PARTIAL[idx - 1]}"
+      else out+="${eb}░"; fi
+    done
+  else
+    for ((i = 0; i < bw; i++)); do
+      (( (i + phase) % 12 < 6 )) && out+="${ea}█" || out+="${eb}░"
+    done
+  fi
+  [[ -n $ea ]] && out+="$rs"
+  printf '\r  %s %s\e[K' "$out" "$right" >&2
 }
 
 # ui_box <#hex> <width> <line...>
@@ -1159,9 +1236,63 @@ github_pick_asset() {
   grep -F "/$name" <<<"$assets" | head -1
 }
 
+# dl_now_ms: wall clock in milliseconds (bash 5 float clock, date fallback)
+dl_now_ms() {
+  if [[ -n ${EPOCHREALTIME:-} ]]; then printf '%d' $((${EPOCHREALTIME/./} / 1000))
+  else date +%s%3N; fi
+}
+
+# dl_total <url>: content length of the final response, 0 when unknown / not 2xx
+dl_total() {
+  curl -sSIL --max-time 8 "$1" 2>/dev/null | tr -d '\r' | awk '
+    /^HTTP\/[0-9.]+ [0-9]{3}/ { code = $2; t = 0 }
+    tolower($1) == "content-length:" { t = $2 + 0 }
+    END { if (code == 200 || code == 206) print t + 0; else print 0 }'
+}
+
+# dl_with_bar <url> <dest> <total>: download with an in-place progress bar on stderr.
+# total = 0 -> indeterminate bar. Returns curl's status; curl's own errors are
+# replayed after the bar line so they don't scribble over it.
+dl_with_bar() {
+  local url=$1 dest=$2 total=${3:-0}
+  local pid rc now t0 t_last d d_last=0 speed=0 inst phase=0 tick=0 cols="" errf="$dest.err"
+
+  if [[ ! -t 2 ]]; then          # no tty -> plain download, no control codes
+    curl -fsSL -o "$dest" "$url"
+    return $?
+  fi
+
+  rm -f -- "$errf"
+  curl -fsSL -o "$dest" "$url" 2>"$errf" &
+  pid=$!
+  t0=$(dl_now_ms); t_last=$t0
+  while kill -0 "$pid" 2>/dev/null; do
+    d=$(stat -c%s -- "$dest" 2>/dev/null) || d=0
+    [[ $d =~ ^[0-9]+$ ]] || d=0
+    now=$(dl_now_ms)
+    if ((now - t_last >= 150)); then
+      inst=$(((d - d_last) * 1000 / (now - t_last))); ((inst < 0)) && inst=0
+      if ((speed == 0)); then speed=$inst; else speed=$(((speed * 2 + inst) / 3)); fi
+      t_last=$now; d_last=$d
+    fi
+    ((tick % 25 == 0)) && cols=$(ui_cols)   # terminal width is re-checked only occasionally (resize)
+    ui_dl_bar "$d" "$total" "$speed" $(((now - t0) / 1000)) "$phase" "$cols"
+    phase=$(((phase + 1) % 1000000)); tick=$((tick + 1))
+    sleep 0.2
+  done
+  wait "$pid"; rc=$?
+  d=$(stat -c%s -- "$dest" 2>/dev/null) || d=0
+  ((rc == 0 && total > 0)) && d=$total
+  ui_dl_bar "$d" "$total" "$speed" $((($(dl_now_ms) - t0) / 1000)) "$phase" "$cols"
+  printf '\n' >&2
+  if ((rc != 0)) && [[ -s $errf ]]; then cat "$errf" >&2; fi
+  rm -f -- "$errf"
+  return $rc
+}
+
 # fetch_url <url> -> sets ARCHIVE and DOWNLOADED
 fetch_url() {
-  local url=$1 name dest
+  local url=$1 name dest total=0
   command -v curl >/dev/null || { needs_tool curl; return 1; }
   if [[ $url =~ $GH_RE ]]; then url=$(github_pick_asset "$url") || return 1; fi
   name=${url%%\?*}; name=${name##*/}
@@ -1170,7 +1301,9 @@ fetch_url() {
   dest="$CACHE_DIR/$name"
   [[ $url == http://* ]] && warn "plain http: the download is not protected"
   info "downloading $name"
-  curl -fL --progress-bar -o "$dest" "$url" || { warn "download failed"; rm -f "$dest"; return 1; }
+  rm -f -- "$dest"
+  total=$(dl_total "$url") || total=0
+  dl_with_bar "$url" "$dest" "$total" || { warn "download failed"; rm -f "$dest"; return 1; }
   if file -b "$dest" | grep -qi '^HTML'; then
     warn "got a web page, not a package (wrong link?)"; rm -f "$dest"; return 1
   fi
@@ -2265,10 +2398,117 @@ kemas — install prebuilt packages (tar.gz/tar.xz/tar.zst/zip) as desktop apps
   kemas launch <app>        launch through Kemas and capture runtime errors
   kemas discover <query>    search native repositories and Flatpak remotes
   kemas recover <app>       find package alternatives for an installed app
+  kemas update              check GitHub for updates and self-update
+  kemas pkg list            list installed packages (all|with-kemas|outside)
+  kemas pkg update          update system packages via package manager
+  kemas pkg uninstall <app> uninstall a package (kemas or system)
 
 layout : ~/.local/opt/<name>  ->  symlink ~/.local/bin/<name>  +  .desktop  +  icon
 config : $CFG
 EOF
+}
+
+# kemas_update: self-update from GitHub
+kemas_update() {
+  local repo="Nirune/Kemas" api json latest_ver="" latest_url="" current_ver tmp tag_name
+  command -v curl >/dev/null || { needs_tool curl; return 1; }
+  info "checking for updates..."
+  api="https://api.github.com/repos/$repo/releases/latest"
+  json=$(curl -fsSL "$api" 2>/dev/null) || json=""
+  if [[ -n $json && $json != "[]" ]]; then
+    latest_ver=$(grep -oE '"tag_name": *"[^"]+"' <<<"$json" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    latest_url=$(grep -oE '"browser_download_url": *"[^"]+kemas[^"]*"' <<<"$json" | head -1 | sed -E 's/.*"(https?[^"]+)".*/\1/')
+  fi
+  if [[ -z $latest_ver || -z $latest_url ]]; then
+    info "no releases found, checking latest tag..."
+    api="https://api.github.com/repos/$repo/tags"
+    json=$(curl -fsSL "$api") || json=""
+    if [[ -n $json && $json != "[]" ]]; then
+      tag_name=$(grep -oE '"name": *"[^"]+"' <<<"$json" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+      [[ -n $tag_name ]] && { latest_ver=$tag_name; latest_url="https://github.com/$repo/raw/$tag_name/kemas"; }
+    fi
+  fi
+  if [[ -z $latest_ver || -z $latest_url ]]; then
+    info "no tags found, falling back to main branch..."
+    latest_ver="main"
+    latest_url="https://github.com/$repo/raw/main/kemas"
+  fi
+  current_ver=$KEMAS_VERSION
+  [[ $latest_ver == "$current_ver" ]] && { info "already at latest version ($current_ver)"; return 0; }
+  info "update available: $current_ver -> $latest_ver"
+  gum confirm "Download and install?" || return 0
+  info "downloading kemas $latest_ver"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/kemas-update.XXXXXX")
+  curl -fsSL --progress-bar -o "$tmp" "$latest_url" || { warn "download failed"; rm -f "$tmp"; return 1; }
+  chmod +x "$tmp"
+  # check if downloaded script differs from current
+  if cmp -s "$tmp" "$OPT_DIR/kemas/kemas"; then
+    info "already up to date"
+    rm -f "$tmp"
+    return 0
+  fi
+  mkdir -p "$OPT_DIR/kemas"
+  install -m 755 "$tmp" "$OPT_DIR/kemas/kemas"
+  rm -f "$tmp"
+  ln -sfn "$OPT_DIR/kemas/kemas" "$BIN_DIR/kemas"
+  ok "updated to $latest_ver"
+}
+
+# ---------- pkg command ----------
+pkg_list() {
+  local mode=${1:-all}
+  banner "Package List"
+  list_installed "$mode"
+  ui_pause
+}
+
+pkg_update() {
+  local platform
+  platform=$(detect_platform)
+  case " $platform " in
+    *" arch "*|*" cachyos "*|*" manjaro "*|*" endeavouros "*)
+      command -v pacman >/dev/null || { needs_tool pacman; return 1; }
+      info "updating system packages (pacman)..."
+      sudo pacman -Syu ;;
+    *" debian "*|*" ubuntu "*|*" linuxmint "*|*" pop "*|*" elementary "*)
+      command -v apt-get >/dev/null || { needs_tool apt; return 1; }
+      info "updating system packages (apt)..."
+      sudo apt update && sudo apt upgrade ;;
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*)
+      command -v dnf >/dev/null || { needs_tool dnf; return 1; }
+      info "updating system packages (dnf)..."
+      sudo dnf upgrade ;;
+    *" opensuse "*|*" suse "*|*" sles "*)
+      command -v zypper >/dev/null || { needs_tool zypper; return 1; }
+      info "updating system packages (zypper)..."
+      sudo zypper refresh && sudo zypper update ;;
+    *" alpine "*)
+      command -v apk >/dev/null || { needs_tool apk; return 1; }
+      info "updating system packages (apk)..."
+      sudo apk update && sudo apk upgrade ;;
+    *)
+      warn "unknown distro; run your package manager manually"
+      return 1 ;;
+  esac
+}
+
+pkg_uninstall() {
+  local target=${1:-}
+  [[ -n $target ]] || { warn "usage: kemas pkg uninstall <app-name>"; return 2; }
+  # Check if it's a kemas-installed app
+  if [[ -f $REG_DIR/$target.conf ]] || [[ -f $PKG_REG_DIR/$target.conf ]]; then
+    uninstall_app "$target"
+  else
+    # Try to find it via outside_scan and offer pkg_remove_flow
+    local found=0 src pkg label
+    while IFS=$'\t' read -r src pkg label; do
+      [[ $pkg == "$target" ]] || continue
+      found=1
+      pkg_actions "$src" "$pkg" "$label" 1
+      break
+    done < <(outside_scan all 2>/dev/null)
+    ((found)) || { warn "package not found: $target"; return 1; }
+  fi
 }
 
 main() {
@@ -2291,6 +2531,14 @@ main() {
         *) warn "usage: kemas installed [--with-kemas|--outside]"; return 2 ;;
       esac ;;
     recover) smart_recovery_app "${2:-}" ;;
+    update) kemas_update ;;
+    pkg)
+      case ${2:-} in
+        list) pkg_list "${3:-all}" ;;
+        update) pkg_update ;;
+        uninstall | remove) pkg_uninstall "${3:-}" ;;
+        *) warn "usage: kemas pkg {list|update|uninstall}"; return 2 ;;
+      esac ;;
     "") menu ;;
     *) banner "Install"; if is_url "$1"; then install_from_url "$1"; else do_install "$1"; fi ;;
   esac

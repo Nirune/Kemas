@@ -7,6 +7,7 @@ Install applications from `.tar.gz`, `.tar.xz`, `.tar.zst`, and `.zip` archives 
 ## Features
 
 - Install local archives or download packages from URLs.
+- Live download progress bar with percentage, size, speed, and ETA.
 - Select assets from GitHub repositories and release pages.
 - Create desktop entries and application icons.
 - Manage persistent application configuration and data.
