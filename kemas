@@ -2528,8 +2528,11 @@ pkg_update_one() {
     esac
     info "Update command: ${cmd[*]}"
     gum confirm "Run this update now?" || { info "update cancelled"; return 1; }
-    "${cmd[@]}"
-    if pkg_installed "$src" "$pkg"; then ok "$pkg updated"; else warn "update may not have completed"; return 1; fi
+    if ! "${cmd[@]}"; then
+      warn "update failed for $pkg"
+      return 1
+    fi
+    ok "$pkg updated"
     return 0
   fi
 
