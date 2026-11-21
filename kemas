@@ -829,8 +829,8 @@ pick_icon() {
 reg_save() {
   mkdir -p "$REG_DIR"
   {
-    printf 'NAME=%q\nDISP=%q\nDIR=%q\nLINK=%q\nDESKTOP=%q\nICON=%q\nPACKAGE=%q\n' \
-      "$NAME" "$DISP" "$DIR" "$LINK" "$DESKTOP" "$ICON_NAME" "$PACKAGE"
+    printf 'NAME=%q\nDISP=%q\nDIR=%q\nLINK=%q\nDESKTOP=%q\nICON=%q\nPACKAGE=%q\nSOURCE=%q\n' \
+      "$NAME" "$DISP" "$DIR" "$LINK" "$DESKTOP" "$ICON_NAME" "$PACKAGE" "${SOURCE:-}"
     printf 'ICONFILES=('
     if ((${#ICON_FILES[@]})); then printf ' %q' "${ICON_FILES[@]}"; fi
     printf ' )\n'
@@ -839,7 +839,7 @@ reg_save() {
 
 reg_load() {
   [[ -f $REG_DIR/$1.conf ]] || return 1
-  NAME="" DISP="" DIR="" LINK="" DESKTOP="" ICON="" PACKAGE=""
+  NAME="" DISP="" DIR="" LINK="" DESKTOP="" ICON="" PACKAGE="" SOURCE=""
   ICONFILES=()
   # shellcheck disable=SC1090
   source "$REG_DIR/$1.conf"
@@ -1314,6 +1314,7 @@ fetch_url() {
 
 install_from_url() {
   DOWNLOADED=""
+  SOURCE="$1"   # track original source so 'kemas pkg update' can re-fetch it
   fetch_url "$1" || return 0
   do_install "$ARCHIVE"
   if [[ -n $DOWNLOADED && -f $DOWNLOADED ]] && gum confirm "Delete the downloaded file?"; then
@@ -2401,6 +2402,7 @@ kemas — install prebuilt packages (tar.gz/tar.xz/tar.zst/zip) as desktop apps
   kemas update              check GitHub for updates and self-update
   kemas pkg list            list installed packages (all|with-kemas|outside)
   kemas pkg update          update system packages via package manager
+  kemas pkg update <pkg>    update an individual package (package manager or GitHub source)
   kemas pkg uninstall <app> uninstall a package (kemas or system)
 
 layout : ~/.local/opt/<name>  ->  symlink ~/.local/bin/<name>  +  .desktop  +  icon
@@ -2492,6 +2494,56 @@ pkg_update() {
   esac
 }
 
+# pkg_update_one <name>: update an individual tracked package.
+# Package-manager packages are re-installed via their source command (pacman -S, apt install, ...).
+# Kemas-installed apps from a URL/GitHub release are re-fetched from their tracked source URL.
+pkg_update_one() {
+  local target=${1:-}
+  [[ -n $target ]] || { warn "usage: kemas pkg update <package>"; return 2; }
+
+  # --- tracked through a package manager ---
+  if [[ -f $PKG_REG_DIR/$target.conf ]]; then
+    pkg_reg_load "$PKG_REG_DIR/$target.conf" || return 1
+    local src=$P_SRC pkg=$P_NAME
+    local -a cmd=()
+    case $src in
+      pacman) cmd=(sudo pacman -S -- "$pkg") ;;
+      paru)   cmd=(paru -S -- "$pkg") ;;
+      apt)    cmd=(sudo apt install -- "$pkg") ;;
+      dnf)    cmd=(sudo dnf install -- "$pkg") ;;
+      zypper) cmd=(sudo zypper install -- "$pkg") ;;
+      flatpak) cmd=(flatpak install --user -y flathub "$pkg") ;;
+      *)      warn "unknown package source: $src"; return 1 ;;
+    esac
+    info "Update command: ${cmd[*]}"
+    gum confirm "Run this update now?" || { info "update cancelled"; return 1; }
+    "${cmd[@]}"
+    if pkg_installed "$src" "$pkg"; then ok "$pkg updated"; else warn "update may not have completed"; return 1; fi
+    return 0
+  fi
+
+  # --- kemas-installed app (archive / GitHub release) ---
+  if [[ -f $REG_DIR/$target.conf ]]; then
+    reg_load "$REG_DIR/$target.conf" || return 1
+    if [[ -z ${SOURCE:-} ]]; then
+      warn "$target was installed from an archive; no source URL tracked."
+      info "Reinstall manually: kemas <archive-or-url>"
+      return 1
+    fi
+    info "Tracked source: $SOURCE"
+    if gum confirm "Reinstall from $SOURCE?"; then
+      install_from_url "$SOURCE"
+    else
+      info "update cancelled"
+      return 1
+    fi
+    return 0
+  fi
+
+  warn "package not found: $target"
+  return 1
+}
+
 pkg_uninstall() {
   local target=${1:-}
   [[ -n $target ]] || { warn "usage: kemas pkg uninstall <app-name>"; return 2; }
@@ -2535,9 +2587,10 @@ main() {
     pkg)
       case ${2:-} in
         list) pkg_list "${3:-all}" ;;
-        update) pkg_update ;;
+        update)
+          if [[ -n ${3:-} ]]; then pkg_update_one "$3"; else pkg_update; fi ;;
         uninstall | remove) pkg_uninstall "${3:-}" ;;
-        *) warn "usage: kemas pkg {list|update|uninstall}"; return 2 ;;
+        *) warn "usage: kemas pkg {list|update [package]|uninstall}"; return 2 ;;
       esac ;;
     "") menu ;;
     *) banner "Install"; if is_url "$1"; then install_from_url "$1"; else do_install "$1"; fi ;;
