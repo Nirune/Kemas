@@ -2502,8 +2502,19 @@ pkg_update_one() {
   [[ -n $target ]] || { warn "usage: kemas pkg update <package>"; return 2; }
 
   # --- tracked through a package manager ---
-  if [[ -f $PKG_REG_DIR/$target.conf ]]; then
-    pkg_reg_load "$PKG_REG_DIR/$target.conf" || return 1
+  # Registry files are named SOURCE__PACKAGE.conf, so scan by P_NAME instead
+  # of guessing the exact filename.
+  local pkg_file="" f
+  for f in "$PKG_REG_DIR"/*.conf; do
+    [[ -f $f ]] || continue
+    pkg_reg_load "$f" || continue
+    if [[ $P_NAME == "$target" ]]; then
+      pkg_file=$f
+      break
+    fi
+  done
+  if [[ -n $pkg_file ]]; then
+    pkg_reg_load "$pkg_file" || return 1
     local src=$P_SRC pkg=$P_NAME
     local -a cmd=()
     case $src in
