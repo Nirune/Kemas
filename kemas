@@ -2401,7 +2401,7 @@ kemas — install prebuilt packages (tar.gz/tar.xz/tar.zst/zip) as desktop apps
   kemas recover <app>       find package alternatives for an installed app
   kemas update              check GitHub for updates and self-update
   kemas pkg list            list installed packages (all|with-kemas|outside)
-  kemas pkg update          update system packages via package manager
+  kemas pkg upgrade         update system packages via package manager
   kemas pkg update <pkg>    update an individual package (package manager or GitHub source)
   kemas pkg uninstall <app> uninstall a package (kemas or system)
 
@@ -2583,14 +2583,14 @@ main() {
         *) warn "usage: kemas installed [--with-kemas|--outside]"; return 2 ;;
       esac ;;
     recover) smart_recovery_app "${2:-}" ;;
-    update) kemas_update ;;
+    upgrade) kemas_update ;;
     pkg)
       case ${2:-} in
         list) pkg_list "${3:-all}" ;;
         update)
-          if [[ -n ${3:-} ]]; then pkg_update_one "$3"; else pkg_update; fi ;;
+          if [[ -n ${3:-} ]]; then pkg_update_one "$3"; else warn "usage: kemas pkg update <package>"; return 2; fi ;;
         uninstall | remove) pkg_uninstall "${3:-}" ;;
-        *) warn "usage: kemas pkg {list|update [package]|uninstall}"; return 2 ;;
+        *) warn "usage: kemas pkg {list|upgrade|update <package>|uninstall}"; return 2 ;;
       esac ;;
     "") menu ;;
     *) banner "Install"; if is_url "$1"; then install_from_url "$1"; else do_install "$1"; fi ;;
