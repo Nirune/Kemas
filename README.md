@@ -18,6 +18,7 @@ Turn `.tar.gz`, `.tar.xz`, `.tar.zst`, `.zip`, `.deb`, and `.AppImage` archives 
 - Recover by finding alternative packages for installed applications.
 - Track and remove packages installed through Kemas, including system packages.
 - Clean up leftover application data with backup/restore.
+- Self-update from GitHub (`kemas update`).
 - Settings: package source folder, icon font, accent color, letter/icon colors, clean or Nerd Font interface style.
 
 ## Installation
@@ -72,6 +73,12 @@ git pull
 
 The installer updates the executable without removing your existing configuration or application data.
 
+Or self-update from GitHub:
+
+```bash
+kemas update
+```
+
 ## Usage
 
 ```bash
@@ -94,6 +101,7 @@ kemas installed --outside
 
 # Manage packages (kemas-tracked or system)
 kemas pkg list
+kemas pkg upgrade         update system packages via package manager
 kemas pkg update <pkg>    update an individual package (package manager or GitHub source)
 kemas pkg uninstall <app> uninstall a package (kemas or system)
 
@@ -113,8 +121,8 @@ kemas recover <app>
 # Manage leftover application data
 kemas cleanup
 
-# Update an individual package
-kemas update <pkg>
+# Check for Kemas updates (self-update)
+kemas update
 
 # Show help
 kemas --help
