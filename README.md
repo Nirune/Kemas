@@ -101,8 +101,9 @@ kemas installed --outside
 
 # Manage packages (kemas-tracked or system)
 kemas pkg list
-kemas pkg update
-kemas pkg uninstall <app>
+kemas pkg upgrade         update system packages via package manager
+kemas pkg update <pkg>    update an individual package (package manager or GitHub source)
+kemas pkg uninstall <app> uninstall a package (kemas or system)
 
 # Diagnose an installed application
 kemas diagnose <app>
@@ -120,8 +121,11 @@ kemas recover <app>
 # Manage leftover application data
 kemas cleanup
 
-# Check for Kemas updates
+# Check for Kemas updates (self-update)
 kemas update
+
+# Update an individual package
+kemas update <pkg>
 
 # Show help
 kemas --help
