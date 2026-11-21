@@ -2399,11 +2399,8 @@ kemas — install prebuilt packages (tar.gz/tar.xz/tar.zst/zip) as desktop apps
   kemas launch <app>        launch through Kemas and capture runtime errors
   kemas discover <query>    search native repositories and Flatpak remotes
   kemas recover <app>       find package alternatives for an installed app
-  kemas update              check GitHub for updates and self-update
-  kemas pkg list            list installed packages (all|with-kemas|outside)
-  kemas update              check GitHub for updates and self-update
   kemas update <pkg>        update an individual package (package manager or GitHub source)
-  kemas pkg upgrade         update system packages via package manager
+  kemas pkg list            list installed packages (all|with-kemas|outside)
   kemas pkg update <pkg>    update an individual package (package manager or GitHub source)
   kemas pkg uninstall <app> uninstall a package (kemas or system)
 
@@ -2412,88 +2409,12 @@ config : $CFG
 EOF
 }
 
-# kemas_update: self-update from GitHub
-kemas_update() {
-  local repo="Nirune/Kemas" api json latest_ver="" latest_url="" current_ver tmp tag_name
-  command -v curl >/dev/null || { needs_tool curl; return 1; }
-  info "checking for updates..."
-  api="https://api.github.com/repos/$repo/releases/latest"
-  json=$(curl -fsSL "$api" 2>/dev/null) || json=""
-  if [[ -n $json && $json != "[]" ]]; then
-    latest_ver=$(grep -oE '"tag_name": *"[^"]+"' <<<"$json" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-    latest_url=$(grep -oE '"browser_download_url": *"[^"]+kemas[^"]*"' <<<"$json" | head -1 | sed -E 's/.*"(https?[^"]+)".*/\1/')
-  fi
-  if [[ -z $latest_ver || -z $latest_url ]]; then
-    info "no releases found, checking latest tag..."
-    api="https://api.github.com/repos/$repo/tags"
-    json=$(curl -fsSL "$api") || json=""
-    if [[ -n $json && $json != "[]" ]]; then
-      tag_name=$(grep -oE '"name": *"[^"]+"' <<<"$json" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-      [[ -n $tag_name ]] && { latest_ver=$tag_name; latest_url="https://github.com/$repo/raw/$tag_name/kemas"; }
-    fi
-  fi
-  if [[ -z $latest_ver || -z $latest_url ]]; then
-    info "no tags found, falling back to main branch..."
-    latest_ver="main"
-    latest_url="https://github.com/$repo/raw/main/kemas"
-  fi
-  current_ver=$KEMAS_VERSION
-  [[ $latest_ver == "$current_ver" ]] && { info "already at latest version ($current_ver)"; return 0; }
-  info "update available: $current_ver -> $latest_ver"
-  gum confirm "Download and install?" || return 0
-  info "downloading kemas $latest_ver"
-  tmp=$(mktemp "${TMPDIR:-/tmp}/kemas-update.XXXXXX")
-  curl -fsSL --progress-bar -o "$tmp" "$latest_url" || { warn "download failed"; rm -f "$tmp"; return 1; }
-  chmod +x "$tmp"
-  # check if downloaded script differs from current
-  if cmp -s "$tmp" "$OPT_DIR/kemas/kemas"; then
-    info "already up to date"
-    rm -f "$tmp"
-    return 0
-  fi
-  mkdir -p "$OPT_DIR/kemas"
-  install -m 755 "$tmp" "$OPT_DIR/kemas/kemas"
-  rm -f "$tmp"
-  ln -sfn "$OPT_DIR/kemas/kemas" "$BIN_DIR/kemas"
-  ok "updated to $latest_ver"
-}
-
 # ---------- pkg command ----------
 pkg_list() {
   local mode=${1:-all}
   banner "Package List"
   list_installed "$mode"
   ui_pause
-}
-
-pkg_update() {
-  local platform
-  platform=$(detect_platform)
-  case " $platform " in
-    *" arch "*|*" cachyos "*|*" manjaro "*|*" endeavouros "*)
-      command -v pacman >/dev/null || { needs_tool pacman; return 1; }
-      info "updating system packages (pacman)..."
-      sudo pacman -Syu ;;
-    *" debian "*|*" ubuntu "*|*" linuxmint "*|*" pop "*|*" elementary "*)
-      command -v apt-get >/dev/null || { needs_tool apt; return 1; }
-      info "updating system packages (apt)..."
-      sudo apt update && sudo apt upgrade ;;
-    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*)
-      command -v dnf >/dev/null || { needs_tool dnf; return 1; }
-      info "updating system packages (dnf)..."
-      sudo dnf upgrade ;;
-    *" opensuse "*|*" suse "*|*" sles "*)
-      command -v zypper >/dev/null || { needs_tool zypper; return 1; }
-      info "updating system packages (zypper)..."
-      sudo zypper refresh && sudo zypper update ;;
-    *" alpine "*)
-      command -v apk >/dev/null || { needs_tool apk; return 1; }
-      info "updating system packages (apk)..."
-      sudo apk update && sudo apk upgrade ;;
-    *)
-      warn "unknown distro; run your package manager manually"
-      return 1 ;;
-  esac
 }
 
 # pkg_update_one <name>: update an individual tracked package.
@@ -2586,15 +2507,14 @@ main() {
       esac ;;
     recover) smart_recovery_app "${2:-}" ;;
     update)
-      if [[ -n ${2:-} ]]; then pkg_update_one "$2"; else kemas_update; fi ;;
+      if [[ -n ${2:-} ]]; then pkg_update_one "$2"; else warn "usage: kemas update <package>"; return 2; fi ;;
     pkg)
       case ${2:-} in
         list) pkg_list "${3:-all}" ;;
-        upgrade) pkg_update ;;
         update)
           if [[ -n ${3:-} ]]; then pkg_update_one "$3"; else warn "usage: kemas pkg update <package>"; return 2; fi ;;
         uninstall | remove) pkg_uninstall "${3:-}" ;;
-        *) warn "usage: kemas pkg {list|upgrade|update <package>|uninstall}"; return 2 ;;
+        *) warn "usage: kemas pkg {list|update <package>|uninstall}"; return 2 ;;
       esac ;;
     "") menu ;;
     *) banner "Install"; if is_url "$1"; then install_from_url "$1"; else do_install "$1"; fi ;;
